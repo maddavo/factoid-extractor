@@ -89,3 +89,19 @@ For each proposed delta, judge:
 ## Important limitation
 
 This is a live extraction test harness, not a final continuity system. A viability conclusion should only be written after running it against real Sage chats and reviewing the exported proposals.
+
+## v0.1.3 / Extension v04 fix
+
+- Fixed object-removal proposals where the extractor returned an object instead of a string.
+- The review panel now converts object-form removal targets to the object name instead of showing `[object Object]`.
+- Applying a removal now correctly removes the stored nearby object when the target is supplied as `{ "name": "..." }` or similar.
+- The extractor prompt now explicitly asks for `nearby_objects_remove` as string-only object names.
+
+
+## v0.1.4 / Extension v05 fix
+
+- Changed the rendered OOC scene packet to group nearby objects by location.
+- Example: `- Cafeteria table: Sage's coffee, Muffin plate` instead of one line per object.
+- Changed the human-readable proposal summary to group proposed object updates by location.
+- Object-removal proposal lines now show the current known location when available, e.g. `- REMOVE Cafeteria table: Sage's coffee`.
+- Internal state is still object-centric (`name` + `location`) so movement and removal remain reliable; only the packet/review rendering changed.

@@ -1,5 +1,5 @@
 // Sage Phase 1 Factoid Extractor for SillyTavern
-// v0.1.2 — review-first, Phase 1 only: CurrentScene + RecentEvents. Human-readable proposal summary.
+// v0.1.4 — review-first, Phase 1 only: CurrentScene + RecentEvents. Grouped object-location packet rendering.
 
 const MODULE_NAME = 'sage_phase1_factoid_extractor';
 const MODULE_TITLE = 'Sage Phase 1 Factoid Extractor';
@@ -52,6 +52,7 @@ STRICT RULES:
 - Do not infer hidden motives.
 - Do not invent.
 - Preserve actor/object names.
+- For nearby_objects_remove, output only the object name as a string, never an object.
 - Avoid pronouns in stored facts.
 - Do not store mood as a scene fact.
 - Do not store generic flirt lines, banter, emotional colour, or decorative ambience unless it changes practical state.
@@ -167,10 +168,25 @@ function toastWarn(message) { globalThis.toastr?.warning?.(message, MODULE_TITLE
 function toastError(message) { globalThis.toastr?.error?.(message, MODULE_TITLE); }
 
 function sanitizeText(text) {
-    return String(text || '')
+    if (text === null || text === undefined) return '';
+    if (typeof text === 'object') return sanitizeObjectText(text);
+    return String(text)
         .replace(/<[^>]*>/g, ' ')
         .replace(/\s+/g, ' ')
         .trim();
+}
+
+function sanitizeObjectText(value) {
+    if (!value || typeof value !== 'object') return '';
+    const candidate = value.name ?? value.object ?? value.object_name ?? value.item ?? value.label ?? value.summary ?? value.text ?? '';
+    if (candidate) return sanitizeText(candidate);
+    try { return JSON.stringify(value); } catch { return ''; }
+}
+
+function objectRemoveName(value) {
+    if (typeof value === 'string') return sanitizeText(value);
+    if (!value || typeof value !== 'object') return '';
+    return sanitizeText(value.name ?? value.object ?? value.object_name ?? value.item ?? value.label ?? value.target ?? value.current_name ?? '');
 }
 
 function roleOfMessage(message) {
@@ -395,7 +411,9 @@ function normalizeProposal(raw) {
             evidence: sanitizeText(o.evidence)
         }));
 
-    normalized.scene_update.nearby_objects_remove = normalized.scene_update.nearby_objects_remove.map(sanitizeText).filter(Boolean);
+    normalized.scene_update.nearby_objects_remove = normalized.scene_update.nearby_objects_remove
+        .map(objectRemoveName)
+        .filter(Boolean);
     normalized.scene_update.present_entities_add = normalized.scene_update.present_entities_add.map(sanitizeText).filter(Boolean);
     normalized.scene_update.present_entities_remove = normalized.scene_update.present_entities_remove.map(sanitizeText).filter(Boolean);
     if (normalized.scene_update.location_ref !== null) normalized.scene_update.location_ref = sanitizeText(normalized.scene_update.location_ref);
@@ -607,17 +625,42 @@ function sameText(a, b) {
     return String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
 }
 
+function groupObjectsByLocation(objects) {
+    const groups = [];
+    const indexByLocation = new Map();
+    for (const obj of objects || []) {
+        const name = sanitizeText(obj?.name);
+        const location = sanitizeText(obj?.location);
+        if (!name || !location) continue;
+        const key = location.toLowerCase();
+        let group = indexByLocation.get(key);
+        if (!group) {
+            group = { location, names: [] };
+            indexByLocation.set(key, group);
+            groups.push(group);
+        }
+        if (!group.names.some(existing => sameText(existing, name))) group.names.push(name);
+    }
+    return groups;
+}
+
+function groupedObjectLines(objects) {
+    return groupObjectsByLocation(objects).map(group => `${group.location}: ${group.names.join(', ')}`);
+}
+
+function findCurrentObjectLocation(objectName) {
+    const scene = metadata().currentScene || EMPTY_SCENE;
+    const found = (scene.nearby_objects || []).find(o => sameText(o?.name, objectName));
+    return found?.location || '';
+}
+
 function renderPackets() {
     const m = metadata();
     const scene = m.currentScene || EMPTY_SCENE;
     const sceneLines = [];
     if (scene.location_ref) sceneLines.push(`Current location: ${scene.location_ref}`);
     if (scene.present_entities?.length) sceneLines.push(`Present entities: ${scene.present_entities.join(', ')}`);
-    if (scene.nearby_objects?.length) {
-        for (const obj of scene.nearby_objects) {
-            if (obj.name && obj.location) sceneLines.push(`${obj.name}: ${obj.location}`);
-        }
-    }
+    sceneLines.push(...groupedObjectLines(scene.nearby_objects));
     if (scene.surroundings_summary) sceneLines.push(`Surroundings: ${scene.surroundings_summary}`);
 
     const eventLines = (m.recentEvents || [])
@@ -625,8 +668,8 @@ function renderPackets() {
         .slice(0, Number(settings().unresolvedEventLimit || 6))
         .map(e => e.causal_result ? `${e.summary}; result: ${e.causal_result}` : e.summary);
 
-    const scenePacket = `sap_inj_scene:\n[OOC scene facts:\n${sceneLines.map(x => `- ${x}`).join('\n')}\n]`;
-    const eventPacket = `sap_inj_recent_events:\n[OOC recent facts:\n${eventLines.map(x => `- ${x}`).join('\n')}\n]`;
+    const scenePacket = ['sap_inj_scene:', '[OOC scene facts:', ...sceneLines.map(x => `- ${x}`), ']'].join('\n');
+    const eventPacket = ['sap_inj_recent_events:', '[OOC recent facts:', ...eventLines.map(x => `- ${x}`), ']'].join('\n');
     return `${scenePacket}\n\n${eventPacket}`;
 }
 
@@ -683,16 +726,19 @@ function renderProposalSummary(proposal) {
         lines.push(`- REMOVE Present entity: ${ent}`);
         sceneCount++;
     }
-    for (const obj of su.nearby_objects_add_or_update || []) {
-        const line = packetLineForObject(obj);
-        if (line) {
-            lines.push(`- ADD/UPDATE Object location: ${line}`);
-            if (obj.evidence) lines.push(`  Evidence: ${obj.evidence}`);
-            sceneCount++;
-        }
+    const objectUpdateGroups = groupObjectsByLocation(su.nearby_objects_add_or_update || []);
+    for (const group of objectUpdateGroups) {
+        lines.push(`- ADD/UPDATE ${group.location}: ${group.names.join(', ')}`);
+        const evidence = (su.nearby_objects_add_or_update || [])
+            .filter(o => sameText(o?.location, group.location) && o?.evidence)
+            .map(o => sanitizeText(o.evidence))
+            .filter(Boolean)[0];
+        if (evidence) lines.push(`  Evidence: ${evidence}`);
+        sceneCount++;
     }
     for (const objName of su.nearby_objects_remove || []) {
-        lines.push(`- REMOVE Object/location: ${objName}`);
+        const currentLocation = findCurrentObjectLocation(objName);
+        lines.push(currentLocation ? `- REMOVE ${currentLocation}: ${objName}` : `- REMOVE Object/location: ${objName}`);
         sceneCount++;
     }
     if (nonEmpty(su.surroundings_summary)) {
