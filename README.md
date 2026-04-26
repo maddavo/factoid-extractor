@@ -1,4 +1,12 @@
-# Sage Phase 1 Factoid Extractor v0.1.17
+# Sage Phase 1 Factoid Extractor v0.1.19
+
+## v0.1.19 changes
+
+- Repairs a local-model near-JSON error where a property key is emitted with a double colon, e.g. `"name":: "Special Punch"`.
+- Adds extractor prompt wording prohibiting doubled JSON colons.
+- Retains all v0.1.18 split-location/remote-communication handling.
+
+# Sage Phase 1 Factoid Extractor v0.1.18
 
 Review-first SillyTavern UI extension for testing live Phase 1 factoid extraction in the Sage continuity project.
 
@@ -9,13 +17,14 @@ It proposes sparse deltas for:
 
 It does not redesign the Sage card/preset, build Data Bank, or implement persistent long-term memory.
 
-## v0.1.17 changes
+## v0.1.18 changes
 
-- Allows durable relationship/role/status designations through the strict RecentEvents gate.
-- Treats explicit ongoing labels such as `master`, `mistress`, `dominant`, `submissive`, `owner`, or equivalent role/status language as high-salience RecentEvents when the chat frames them as persistent.
-- Keeps rejecting temporary body-position/contact/intensity narration as surroundings or RecentEvents.
-- Adds high-salience cue detection for those relationship/role terms, so the extractor can trigger before the periodic interval.
-- Retains v0.1.16 surroundings filtering.
+- Adds split-location / remote communication handling for cases where Davo and Sage are no longer physically co-present but continue interacting by text/phone/call.
+- Adds `Remote/split-scene cue prefilter` so the extractor can trigger on texting/phone plus separated-location cues before the periodic interval.
+- Updates extractor instructions to render split scenes without implying physical co-presence.
+- Preferred split-scene packet form: `Split scene: Davo in HOTs kitchen; Sage in Exam Hall`, plus qualified entity lines such as `Davo — local, HOTs kitchen` and `Sage Morgan-Burke — remote, Exam Hall, texting by phone`.
+- Allows remote/texting surroundings summaries even in location-only surroundings mode.
+- Keeps v0.1.17 durable relationship/role/status gate behaviour.
 
 ## v0.1.16 retained behaviour
 

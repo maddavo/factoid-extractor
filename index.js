@@ -1,7 +1,7 @@
 // Sage Phase 1 Factoid Extractor for SillyTavern
-// v0.1.17 — durable relationship/role status event gate.
+// v0.1.19 — near-JSON double-colon repair.
 
-const EXTENSION_VERSION = '0.1.17';
+const EXTENSION_VERSION = '0.1.19';
 
 const MODULE_NAME = 'sage_phase1_factoid_extractor';
 const MODULE_TITLE = 'Sage Phase 1 Factoid Extractor';
@@ -14,6 +14,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     periodicUserMessages: 10,
     sceneCuePrefilter: true,
     highSalienceEventCuePrefilter: true,
+    remoteCommunicationCuePrefilter: true,
     sceneMarkerRegex: '<!--SAP_SCENE_CHANGE-->|<sap_scene_change\\s*/?>|\\[\\[SAP_SCENE_CHANGE\\]\\]',
     endpoint: '/proxy/http://127.0.0.1:1234/v1/chat/completions',
     model: 'local-model',
@@ -54,6 +55,7 @@ PHASE 1 STATE ONLY:
 - object locations
 - one short surroundings summary only if it materially anchors the scene
 - surroundings_summary should be stable environmental context, not body/pose/blocking description
+- split-location remote communication is allowed in CurrentScene using schema-pure text fields
 
 2. RecentEvents:
 - only rare, high-salience facts Sage must remember in the next several turns
@@ -85,6 +87,9 @@ STRICT RULES:
 - Output at most one new RecentEvent per extraction pass. If several candidates exist, keep only the most practically urgent one.
 - Do not treat decorative assistant narration as authoritative when it invents unsupported details.
 - If assistant narration changes a practical state, include it only when the fact is clear and consistent with prior established context.
+- If characters are physically separated but still interacting by text/phone/call/video call, do NOT mark them as physically co-present. This is a split-location remote communication scene.
+- For split-location remote communication, use schema-pure fields: set location_ref to a concise split scene such as "Split scene: Davo in HOTs kitchen; Sage in Exam Hall"; remove unqualified co-present entities such as "Davo" and "Sage Morgan-Burke" if they were previously present together; add qualified entities such as "Davo — local, HOTs kitchen" and "Sage Morgan-Burke — remote, Exam Hall, texting by phone"; put the communication mode in surroundings_summary, e.g. "Davo and Sage are communicating by text while physically separated."
+- For split-location scenes, object locations must include which physical side they belong to, e.g. "HOTs kitchen counter" or "Exam Hall desk". Do not use generic locations like "the floor" without a side/location.
 - If the current location/room changes, remove old room-local nearby_objects unless the object is explicitly carried into the new scene.
 - If new explicit text contradicts old state, prefer the latest explicit fact and include a rejected_candidate or uncertainty note.
 - Cap output to the most important Phase 1 facts. Sparse is better than complete.
@@ -296,7 +301,7 @@ function deterministicSceneCueDetected() {
     if (!text) return false;
 
     const movementCue = /\b(go(?:es|ing)? to|went to|walks? into|walks? out|runs? to|runs? into|leaves?|exits?|enters?|arrives?|returns?|back at|back in|back to|knocks? on|opens? the door|closes? the door|steps? into|heads? to|moves? to)\b/i;
-    const locationCue = /\b(cafeteria|dorm|dorm room|hallway|classroom|chemistry|room|entrance|doorway|outside|inside|table|kitchen|study|bedroom|bathroom|office|garage|car|street|yard|beach|bar|library)\b/i;
+    const locationCue = /\b(cafeteria|dorm|dorm room|hallway|classroom|chemistry|exam hall|exam|room|entrance|doorway|outside|inside|table|kitchen|hots kitchen|study|bedroom|bathroom|office|garage|car|street|yard|beach|bar|library)\b/i;
 
     return movementCue.test(text) && locationCue.test(text);
 }
@@ -317,6 +322,17 @@ function highSalienceEventCueDetected() {
     return acceptanceCue.test(text) && relationshipCue.test(recentChatText(16).toLowerCase());
 }
 
+
+function remoteCommunicationCueDetected() {
+    if (!settings().remoteCommunicationCuePrefilter) return false;
+    const text = recentChatText(12).toLowerCase();
+    if (!text) return false;
+
+    const remoteMode = /\b(texts?|texting|message(?:s|d)?|dm\b|phone|calls?|calling|video call|facetime|sms|reply(?:ing)? by text)\b/i;
+    const separation = /\b(left|leaves|went to|goes to|gone to|exam|exam hall|class|classroom|kitchen|hots kitchen|not in the same room|physically separated|remote|away|elsewhere)\b/i;
+    return remoteMode.test(text) && separation.test(text);
+}
+
 function autoRunGate(reason) {
     const s = settings();
     const m = metadata();
@@ -332,6 +348,7 @@ function autoRunGate(reason) {
     const marker = sceneMarkerDetected();
     const cue = Boolean(s.sceneCuePrefilter) && deterministicSceneCueDetected();
     const eventCue = highSalienceEventCueDetected();
+    const remoteCue = remoteCommunicationCueDetected();
     const intervalReached = 'periodic interval reached (' + sinceLast + '/' + interval + ' user messages)';
     const intervalNotReached = 'periodic interval not reached (' + sinceLast + '/' + interval + ' user messages)';
 
@@ -348,8 +365,9 @@ function autoRunGate(reason) {
     if (marker) return { run: true, reason: 'scene marker detected' };
     if (cue) return { run: true, reason: 'deterministic scene cue detected' };
     if (eventCue) return { run: true, reason: 'high-salience event cue detected' };
+    if (remoteCue) return { run: true, reason: 'remote communication/split-scene cue detected' };
     if (periodicDue) return { run: true, reason: intervalReached };
-    return { run: false, reason: 'no scene/event cue or marker and ' + intervalNotReached };
+    return { run: false, reason: 'no scene/event/remote cue or marker and ' + intervalNotReached };
 }
 
 function buildExtractorUserPayload() {
@@ -524,6 +542,8 @@ function repairNearJson(text) {
     s = s.replace(/(^|\s)\/\/.*$/gm, '$1');
     // LM Studio/local models often emit trailing commas, which cause: "Expected double-quoted property name".
     s = s.replace(/,\s*([}\]])/g, '$1');
+    // Tolerate accidental doubled colons after a quoted key, e.g. "name":: "Special Punch".
+    s = s.replace(/("[A-Za-z_][A-Za-z0-9_\-]*")\s*::\s*/g, '$1: ');
     // Tolerate Markdown-emphasised keys from local models, e.g. *importance_score*: 4 or **key**: value.
     s = s.replace(/([{,]\s*)\*\*([A-Za-z_][A-Za-z0-9_\-]*)\*\*\s*:/g, '$1\"$2\":');
     s = s.replace(/([{,]\s*)\*([A-Za-z_][A-Za-z0-9_\-]*)\*\s*:/g, '$1\"$2\":');
@@ -682,10 +702,53 @@ function normalizeProposal(raw) {
     if (normalized.scene_update.location_ref !== null) normalized.scene_update.location_ref = sanitizeText(normalized.scene_update.location_ref);
     if (normalized.scene_update.surroundings_summary !== null) normalized.scene_update.surroundings_summary = sanitizeText(normalized.scene_update.surroundings_summary);
 
+    normalizeSplitRemoteSceneDelta(normalized);
     filterSurroundingsDelta(normalized);
     return filterNoOpSceneDelta(normalized);
 }
 
+
+function normalizeSplitRemoteSceneDelta(delta) {
+    if (!settings().remoteCommunicationCuePrefilter) return delta;
+    const su = delta?.scene_update || {};
+    const combined = [su.location_ref, su.surroundings_summary, recentChatText(12)].map(sanitizeText).join(' ').toLowerCase();
+    const splitLikely = /\bsplit scene\b|\bphysically separated\b|\bremote\b|\btext(?:s|ing)?\b|\bphone\b|\bcall(?:s|ing)?\b|\bexam hall\b|\bhots kitchen\b/.test(combined)
+        && /\b(davo|sage)\b/.test(combined);
+    if (!splitLikely) return delta;
+
+    const addSet = new Set((su.present_entities_add || []).map(canonicalKey));
+    const hasQualified = (su.present_entities_add || []).some(ent => /—|\bremote\b|\blocal\b|\btexting\b|\bphone\b|\bexam hall\b|\bkitchen\b/i.test(ent));
+    const currentPresent = Array.isArray(metadata().currentScene?.present_entities) ? metadata().currentScene.present_entities : [];
+
+    // Avoid false co-presence: if the model added qualified split-entities, remove old unqualified entries.
+    if (hasQualified) {
+        su.present_entities_remove = su.present_entities_remove || [];
+        for (const ent of currentPresent) {
+            const plain = sanitizeText(ent);
+            if (!plain) continue;
+            if (/—|\bremote\b|\blocal\b|\btexting\b|\bphone\b/i.test(plain)) continue;
+            const firstName = canonicalKey(plain.split(/\s+/)[0]);
+            const covered = [...addSet].some(x => firstName && x.includes(firstName));
+            if (covered && !su.present_entities_remove.some(existing => sameText(existing, plain))) {
+                su.present_entities_remove.push(plain);
+            }
+        }
+    }
+
+    if (su.location_ref && !/^split scene\s*:/i.test(su.location_ref) && /\b(text|phone|call|remote|physically separated|exam hall)\b/i.test(combined)) {
+        delta.rejected_candidates = [
+            ...(delta.rejected_candidates || []),
+            { candidate: 'Split-location remote communication', reason: 'Ensure packet does not imply physical co-presence; location_ref should be a split-scene line if both characters remain active in different places.' }
+        ];
+    }
+    return delta;
+}
+
+function isSplitSceneState(scene) {
+    const combined = `${scene?.location_ref || ''} ${scene?.surroundings_summary || ''}`.toLowerCase();
+    return /\bsplit scene\b|\bphysically separated\b|\bremote\b|\btexting\b|\bphone\b|\bexam hall\b/.test(combined)
+        && /\b(davo|sage)\b/.test(combined);
+}
 
 function filterSurroundingsDelta(delta) {
     const su = delta?.scene_update || {};
@@ -702,6 +765,7 @@ function filterSurroundingsDelta(delta) {
 
     if (locationChanges || initialLocationSet) return delta;
     if (isStableEnvironmentSurroundings(summary)) return delta;
+    if (isRemoteCommunicationSurroundings(summary)) return delta;
 
     const reason = isTransientBodyOrInteractionSummary(summary)
         ? 'Suppressed surroundings update: body position/touch/intensity/blocking changes are not stable scene surroundings.'
@@ -723,6 +787,13 @@ function isStableEnvironmentSurroundings(text) {
     const stableEnvironment = /\b(door|window|lock|locked|unlocked|open|opened|closed|shut|lights?|dark|lit|lamp|power|outage|shower|bathroom|water|running|faucet|tap|flood|flooded|smoke|fire|alarm|broken|breaks|damaged|spilled|spill|mess|blocked|barricaded|curtain|blind|heater|fan|air conditioner|ac)\b/;
     const subLocation = /\b(bathroom|shower|hallway|corridor|doorway|entrance|balcony|outside|inside|kitchen|office|garage|car|street|yard|library|cafeteria|classroom|bedroom)\b/;
     return stableEnvironment.test(t) || subLocation.test(t);
+}
+
+function isRemoteCommunicationSurroundings(text) {
+    const t = sanitizeText(text).toLowerCase();
+    if (!t) return false;
+    return /\b(texting|text message|phone|call|calling|video call|physically separated|remote communication|not in the same room|split scene|exam hall)\b/.test(t)
+        && /\b(davo|sage)\b/.test(t);
 }
 
 function isTransientBodyOrInteractionSummary(text) {
@@ -1239,8 +1310,8 @@ function renderPackets() {
     const m = metadata();
     const scene = m.currentScene || EMPTY_SCENE;
     const sceneLines = [];
-    if (scene.location_ref) sceneLines.push(`Current location: ${scene.location_ref}`);
-    if (scene.present_entities?.length) sceneLines.push(`Present entities: ${scene.present_entities.join(', ')}`);
+    if (scene.location_ref) sceneLines.push(`${isSplitSceneState(scene) ? 'Split scene' : 'Current location'}: ${scene.location_ref.replace(/^Split scene:\s*/i, '')}`);
+    if (scene.present_entities?.length) sceneLines.push(`${isSplitSceneState(scene) ? 'Entities' : 'Present entities'}: ${scene.present_entities.join(', ')}`);
     sceneLines.push(...groupedObjectLines(scene.nearby_objects));
     if (scene.surroundings_summary) sceneLines.push(`Surroundings: ${scene.surroundings_summary}`);
 
@@ -1498,6 +1569,7 @@ function updatePanel() {
     setInputValue('sfe_periodic_user_messages', s.periodicUserMessages);
     setInputValue('sfe_scene_cue_prefilter', s.sceneCuePrefilter, 'checked');
     setInputValue('sfe_event_cue_prefilter', s.highSalienceEventCuePrefilter, 'checked');
+    setInputValue('sfe_remote_cue_prefilter', s.remoteCommunicationCuePrefilter, 'checked');
     setInputValue('sfe_scene_marker_regex', s.sceneMarkerRegex);
     setInputValue('sfe_json_response', s.responseFormatJson, 'checked');
     setInputValue('sfe_strict_events', s.strictRecentEvents, 'checked');
@@ -1563,7 +1635,7 @@ function installUi() {
 
   <div class="sfe-row"><label><input id="sfe_enabled" type="checkbox"> Enabled</label><label><input id="sfe_autorun" type="checkbox"> Auto-run</label><label><input id="sfe_autoapply" type="checkbox"> Auto-apply proposed deltas</label><label><input id="sfe_debug" type="checkbox"> Debug console logging</label></div>
   <div class="sfe-row"><label for="sfe_trigger">Trigger</label><select id="sfe_trigger"><option value="assistant">After assistant reply</option><option value="user_and_assistant">After user and assistant messages</option></select></div>
-  <div class="sfe-row"><label for="sfe_autorun_policy">Auto-run policy</label><select id="sfe_autorun_policy"><option value="periodic_or_scene_cue">Periodic or scene/event cue</option><option value="periodic_or_marker">Periodic or explicit marker only</option><option value="periodic_only">Periodic only</option><option value="always">Always run on trigger</option></select><label for="sfe_periodic_user_messages">Every N user messages</label><input id="sfe_periodic_user_messages" type="number" min="1" max="50" step="1"><label><input id="sfe_scene_cue_prefilter" type="checkbox"> Scene cue prefilter</label><label><input id="sfe_event_cue_prefilter" type="checkbox"> High-salience event cue prefilter</label></div>
+  <div class="sfe-row"><label for="sfe_autorun_policy">Auto-run policy</label><select id="sfe_autorun_policy"><option value="periodic_or_scene_cue">Periodic or scene/event cue</option><option value="periodic_or_marker">Periodic or explicit marker only</option><option value="periodic_only">Periodic only</option><option value="always">Always run on trigger</option></select><label for="sfe_periodic_user_messages">Every N user messages</label><input id="sfe_periodic_user_messages" type="number" min="1" max="50" step="1"><label><input id="sfe_scene_cue_prefilter" type="checkbox"> Scene cue prefilter</label><label><input id="sfe_event_cue_prefilter" type="checkbox"> High-salience event cue prefilter</label><label><input id="sfe_remote_cue_prefilter" type="checkbox"> Remote/split-scene cue prefilter</label></div>
   <div class="sfe-row"><label for="sfe_scene_marker_regex">Scene marker regex</label><input id="sfe_scene_marker_regex" type="text" spellcheck="false"></div>
   <div class="sfe-row"><label for="sfe_endpoint">Extractor endpoint</label><input id="sfe_endpoint" type="text" spellcheck="false"></div>
   <div class="sfe-row"><label for="sfe_model">Model</label><input id="sfe_model" type="text" spellcheck="false"></div>
@@ -1614,6 +1686,7 @@ function installUi() {
     bindSetting('sfe_periodic_user_messages', 'periodicUserMessages', 'number');
     bindSetting('sfe_scene_cue_prefilter', 'sceneCuePrefilter', 'boolean');
     bindSetting('sfe_event_cue_prefilter', 'highSalienceEventCuePrefilter', 'boolean');
+    bindSetting('sfe_remote_cue_prefilter', 'remoteCommunicationCuePrefilter', 'boolean');
     bindSetting('sfe_scene_marker_regex', 'sceneMarkerRegex');
     bindSetting('sfe_json_response', 'responseFormatJson', 'boolean');
     bindSetting('sfe_strict_events', 'strictRecentEvents', 'boolean');
