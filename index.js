@@ -1,7 +1,7 @@
 // Sage Phase 1 Factoid Extractor for SillyTavern
-// v0.1.14 — no-op proposal filtering and contradictory object-delta cleanup.
+// v0.1.15 — high-salience event triggers and relationship-status RecentEvents.
 
-const EXTENSION_VERSION = '0.1.14';
+const EXTENSION_VERSION = '0.1.15';
 
 const MODULE_NAME = 'sage_phase1_factoid_extractor';
 const MODULE_TITLE = 'Sage Phase 1 Factoid Extractor';
@@ -13,6 +13,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     autoRunPolicy: 'periodic_or_scene_cue', // always | periodic_only | periodic_or_marker | periodic_or_scene_cue
     periodicUserMessages: 10,
     sceneCuePrefilter: true,
+    highSalienceEventCuePrefilter: true,
     sceneMarkerRegex: '<!--SAP_SCENE_CHANGE-->|<sap_scene_change\\s*/?>|\\[\\[SAP_SCENE_CHANGE\\]\\]',
     endpoint: '/proxy/http://127.0.0.1:1234/v1/chat/completions',
     model: 'local-model',
@@ -53,9 +54,10 @@ PHASE 1 STATE ONLY:
 - one short surroundings summary only if it materially anchors the scene
 
 2. RecentEvents:
-- only rare, temporary, unresolved practical reminders that Sage must remember in the next several turns
-- use RecentEvents only when there is a clear consequence not already captured by CurrentScene
-- examples that usually qualify: object broken and still matters, important item lost and not found, explicit promise/request/task/deadline, urgent interruption, a plan changed with unresolved next action, factual reminder that must affect the next response
+- only rare, high-salience facts Sage must remember in the next several turns
+- normally use RecentEvents only when there is a clear unresolved consequence not already captured by CurrentScene
+- exception: major relationship/status changes are valid RecentEvents even if they are not an unresolved task, because Phase 1 has no RelationshipState object yet
+- examples that usually qualify: object broken and still matters, important item lost and not found, explicit promise/request/task/deadline, urgent interruption, a plan changed with unresolved next action, factual reminder that must affect the next response, explicit girlfriend/boyfriend/partner/relationship status change
 - examples that usually do NOT qualify: ordinary dialogue progress, greetings, banter, flirtation, emotional colour, a normal question/answer, a minor observation, scene transition already stored in CurrentScene, object placement/movement already stored in CurrentScene, person entered/left already reflected in present_entities, completed handover with no unresolved consequence
 
 STRICT RULES:
@@ -68,11 +70,12 @@ STRICT RULES:
 - Avoid pronouns in stored facts.
 - Do not store mood as a scene fact.
 - Do not store generic flirt lines, banter, emotional colour, ordinary replies, questions, acknowledgements, or decorative ambience as RecentEvents.
+- If one character asks for a committed relationship and the other explicitly accepts, store one RecentEvent with importance_score 5, e.g. "Sage accepted Davo's request to be her boyfriend/girlfriend/partner; their relationship status changed."
 - Do not turn every response into a RecentEvent. RecentEvents should be rare.
 - Do not duplicate CurrentScene in RecentEvents. If the scene/object state already captures the change, leave recent_event_updates empty unless there is a still-unresolved practical consequence.
 - Do not output no-op scene updates. If an object is already recorded at the same location, do not add/update it again.
 - Do not output both add/update and remove for the same object in one proposal. If the object is still present, do not remove it.
-- A RecentEvent must pass this gate: would omitting it likely cause Sage to contradict an unresolved task, obligation, broken/lost item, urgent interruption, or changed plan within the next 5-10 turns? If no, do not extract it.
+- A RecentEvent must pass this gate: would omitting it likely cause Sage to contradict an unresolved task, obligation, broken/lost item, urgent interruption, changed plan, or major relationship/status change within the next 5-10 turns? If no, do not extract it.
 - For RecentEvents, importance_score uses 0-5. Output only importance_score 4 or 5 events.
 - Output at most one new RecentEvent per extraction pass. If several candidates exist, keep only the most practically urgent one.
 - Do not treat decorative assistant narration as authoritative when it invents unsupported details.
@@ -293,6 +296,22 @@ function deterministicSceneCueDetected() {
     return movementCue.test(text) && locationCue.test(text);
 }
 
+function highSalienceEventCueDetected() {
+    if (!settings().highSalienceEventCuePrefilter) return false;
+    const text = recentChatText(10).toLowerCase();
+    if (!text) return false;
+
+    const relationshipCue = /\b(girlfriend|boyfriend|partner|relationship|dating|date me|go out with me|be with me|be my|official|couple)\b/i;
+    const acceptanceCue = /\b(yes|okay|ok|accepted?|agreed?|i will|i do|of course|let's|we are|we're|i'd like that|i want that)\b/i;
+    const commitmentCue = /\b(promised|promise|agreed to|agreement|deal|plan changed|new plan|deadline|urgent|important|remember|remind me|don't forget|owe|waiting for|depends on|blocked|lost|missing|broken|stolen|hidden)\b/i;
+
+    // Relationship terms alone wake the extractor; the extractor still decides whether a true status change occurred.
+    if (relationshipCue.test(text)) return true;
+    if (commitmentCue.test(text)) return true;
+    // Catch short acceptance lines following a recent relationship proposal.
+    return acceptanceCue.test(text) && relationshipCue.test(recentChatText(16).toLowerCase());
+}
+
 function autoRunGate(reason) {
     const s = settings();
     const m = metadata();
@@ -307,6 +326,7 @@ function autoRunGate(reason) {
     const periodicDue = sinceLast >= interval;
     const marker = sceneMarkerDetected();
     const cue = Boolean(s.sceneCuePrefilter) && deterministicSceneCueDetected();
+    const eventCue = highSalienceEventCueDetected();
     const intervalReached = 'periodic interval reached (' + sinceLast + '/' + interval + ' user messages)';
     const intervalNotReached = 'periodic interval not reached (' + sinceLast + '/' + interval + ' user messages)';
 
@@ -322,8 +342,9 @@ function autoRunGate(reason) {
 
     if (marker) return { run: true, reason: 'scene marker detected' };
     if (cue) return { run: true, reason: 'deterministic scene cue detected' };
+    if (eventCue) return { run: true, reason: 'high-salience event cue detected' };
     if (periodicDue) return { run: true, reason: intervalReached };
-    return { run: false, reason: 'no scene cue/marker and ' + intervalNotReached };
+    return { run: false, reason: 'no scene/event cue or marker and ' + intervalNotReached };
 }
 
 function buildExtractorUserPayload() {
@@ -768,6 +789,9 @@ function eventGateReason(event, minImportance, sceneUpdate = null) {
 
     const combined = `${summary} ${result}`.toLowerCase();
 
+    const relationshipStatusPattern = /\b(girlfriend|boyfriend|partner|relationship|dating|official|couple|accepted .* request|agreed .* relationship|relationship status changed|became .* girlfriend|became .* boyfriend|became .* partner)\b/;
+    const hasRelationshipStatusCue = relationshipStatusPattern.test(combined);
+
     const unresolvedPracticalPatterns = [
         /\b(broke|broken|breaks|damaged|damage|lost|missing|can't find|cannot find|not found|hid|hidden|stolen)\b/,
         /\b(promised|promise|agreed to|agreement|asked .* to|requested|request|task|deadline|urgent|must|needs to|need to|has to|still needs)\b/,
@@ -775,8 +799,8 @@ function eventGateReason(event, minImportance, sceneUpdate = null) {
         /\b(interrupted by|alarm|phone call|knock at the door|emergency)\b/
     ];
     const hasUnresolvedPracticalCue = unresolvedPracticalPatterns.some(re => re.test(combined));
-    if (!hasUnresolvedPracticalCue) {
-        return 'Dropped RecentEvent candidate: no clear unresolved task/problem/changed-plan consequence beyond CurrentScene.';
+    if (!hasUnresolvedPracticalCue && !hasRelationshipStatusCue) {
+        return 'Dropped RecentEvent candidate: no clear unresolved task/problem/changed-plan/relationship-status consequence beyond CurrentScene.';
     }
 
     if (sceneUpdate && eventDuplicatesSceneDelta(event, sceneUpdate)) {
@@ -1418,6 +1442,7 @@ function updatePanel() {
     setInputValue('sfe_autorun_policy', s.autoRunPolicy);
     setInputValue('sfe_periodic_user_messages', s.periodicUserMessages);
     setInputValue('sfe_scene_cue_prefilter', s.sceneCuePrefilter, 'checked');
+    setInputValue('sfe_event_cue_prefilter', s.highSalienceEventCuePrefilter, 'checked');
     setInputValue('sfe_scene_marker_regex', s.sceneMarkerRegex);
     setInputValue('sfe_json_response', s.responseFormatJson, 'checked');
     setInputValue('sfe_strict_events', s.strictRecentEvents, 'checked');
@@ -1482,7 +1507,7 @@ function installUi() {
 
   <div class="sfe-row"><label><input id="sfe_enabled" type="checkbox"> Enabled</label><label><input id="sfe_autorun" type="checkbox"> Auto-run</label><label><input id="sfe_autoapply" type="checkbox"> Auto-apply proposed deltas</label><label><input id="sfe_debug" type="checkbox"> Debug console logging</label></div>
   <div class="sfe-row"><label for="sfe_trigger">Trigger</label><select id="sfe_trigger"><option value="assistant">After assistant reply</option><option value="user_and_assistant">After user and assistant messages</option></select></div>
-  <div class="sfe-row"><label for="sfe_autorun_policy">Auto-run policy</label><select id="sfe_autorun_policy"><option value="periodic_or_scene_cue">Periodic or scene cue</option><option value="periodic_or_marker">Periodic or explicit marker only</option><option value="periodic_only">Periodic only</option><option value="always">Always run on trigger</option></select><label for="sfe_periodic_user_messages">Every N user messages</label><input id="sfe_periodic_user_messages" type="number" min="1" max="50" step="1"><label><input id="sfe_scene_cue_prefilter" type="checkbox"> Scene cue prefilter</label></div>
+  <div class="sfe-row"><label for="sfe_autorun_policy">Auto-run policy</label><select id="sfe_autorun_policy"><option value="periodic_or_scene_cue">Periodic or scene/event cue</option><option value="periodic_or_marker">Periodic or explicit marker only</option><option value="periodic_only">Periodic only</option><option value="always">Always run on trigger</option></select><label for="sfe_periodic_user_messages">Every N user messages</label><input id="sfe_periodic_user_messages" type="number" min="1" max="50" step="1"><label><input id="sfe_scene_cue_prefilter" type="checkbox"> Scene cue prefilter</label><label><input id="sfe_event_cue_prefilter" type="checkbox"> High-salience event cue prefilter</label></div>
   <div class="sfe-row"><label for="sfe_scene_marker_regex">Scene marker regex</label><input id="sfe_scene_marker_regex" type="text" spellcheck="false"></div>
   <div class="sfe-row"><label for="sfe_endpoint">Extractor endpoint</label><input id="sfe_endpoint" type="text" spellcheck="false"></div>
   <div class="sfe-row"><label for="sfe_model">Model</label><input id="sfe_model" type="text" spellcheck="false"></div>
@@ -1531,6 +1556,7 @@ function installUi() {
     bindSetting('sfe_autorun_policy', 'autoRunPolicy');
     bindSetting('sfe_periodic_user_messages', 'periodicUserMessages', 'number');
     bindSetting('sfe_scene_cue_prefilter', 'sceneCuePrefilter', 'boolean');
+    bindSetting('sfe_event_cue_prefilter', 'highSalienceEventCuePrefilter', 'boolean');
     bindSetting('sfe_scene_marker_regex', 'sceneMarkerRegex');
     bindSetting('sfe_json_response', 'responseFormatJson', 'boolean');
     bindSetting('sfe_strict_events', 'strictRecentEvents', 'boolean');
