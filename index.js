@@ -1,5 +1,7 @@
 // Sage Phase 1 Factoid Extractor for SillyTavern
-// v0.1.7 — partial JSON recovery for scene-only proposals and stricter extractor output.
+// v0.1.11 — visible throttle controls and version badge.
+
+const EXTENSION_VERSION = '0.1.11';
 
 const MODULE_NAME = 'sage_phase1_factoid_extractor';
 const MODULE_TITLE = 'Sage Phase 1 Factoid Extractor';
@@ -8,6 +10,10 @@ const DEFAULT_SETTINGS = Object.freeze({
     enabled: false,
     autoRun: true,
     trigger: 'assistant', // assistant | user_and_assistant
+    autoRunPolicy: 'periodic_or_scene_cue', // always | periodic_only | periodic_or_marker | periodic_or_scene_cue
+    periodicUserMessages: 10,
+    sceneCuePrefilter: true,
+    sceneMarkerRegex: '<!--SAP_SCENE_CHANGE-->|<sap_scene_change\\s*/?>|\\[\\[SAP_SCENE_CHANGE\\]\\]',
     endpoint: '/proxy/http://127.0.0.1:1234/v1/chat/completions',
     model: 'local-model',
     apiKey: '',
@@ -141,12 +147,15 @@ function saveSettings() {
 
 function defaultMetadata() {
     return {
-        version: '0.1.0',
+        version: EXTENSION_VERSION,
         currentScene: structuredCloneSafe(EMPTY_SCENE),
         recentEvents: [],
         pendingProposals: [],
         auditLog: [],
         lastProcessedSignature: '',
+        lastExtractionUserMessageCount: 0,
+        skippedRuns: 0,
+        lastSkipReason: '',
         lastRunAt: null,
         lastError: '',
         lastRawExtractorText: ''
@@ -162,6 +171,10 @@ function metadata() {
     if (!Array.isArray(m.recentEvents)) m.recentEvents = [];
     if (!Array.isArray(m.pendingProposals)) m.pendingProposals = [];
     if (!Array.isArray(m.auditLog)) m.auditLog = [];
+    if (!m.version) m.version = EXTENSION_VERSION;
+    if (m.lastExtractionUserMessageCount === undefined) m.lastExtractionUserMessageCount = 0;
+    if (m.skippedRuns === undefined) m.skippedRuns = 0;
+    if (m.lastSkipReason === undefined) m.lastSkipReason = '';
     return m;
 }
 
@@ -243,6 +256,70 @@ function chatSignature() {
         last: sanitizeText(last?.mes).slice(0, 500),
         prev: sanitizeText(prev?.mes).slice(0, 200)
     });
+}
+
+function userMessageCount() {
+    const chat = ctx().chat || [];
+    return chat.filter(message => roleOfMessage(message) === 'user').length;
+}
+
+function recentChatText(limit = 6) {
+    const chat = ctx().chat || [];
+    return chat.slice(Math.max(0, chat.length - limit)).map(message => sanitizeText(message?.mes)).join('\n');
+}
+
+function sceneMarkerDetected() {
+    const pattern = settings().sceneMarkerRegex || DEFAULT_SETTINGS.sceneMarkerRegex;
+    if (!pattern) return false;
+    try {
+        return new RegExp(pattern, 'i').test(recentChatText(8));
+    } catch (error) {
+        console.warn('[' + MODULE_TITLE + '] Invalid scene marker regex.', error);
+        return false;
+    }
+}
+
+function deterministicSceneCueDetected() {
+    const text = recentChatText(6).toLowerCase();
+    if (!text) return false;
+
+    const movementCue = /\b(go(?:es|ing)? to|went to|walks? into|walks? out|runs? to|runs? into|leaves?|exits?|enters?|arrives?|returns?|back at|back in|back to|knocks? on|opens? the door|closes? the door|steps? into|heads? to|moves? to)\b/i;
+    const locationCue = /\b(cafeteria|dorm|dorm room|hallway|classroom|chemistry|room|entrance|doorway|outside|inside|table|kitchen|study|bedroom|bathroom|office|garage|car|street|yard|beach|bar|library)\b/i;
+
+    return movementCue.test(text) && locationCue.test(text);
+}
+
+function autoRunGate(reason) {
+    const s = settings();
+    const m = metadata();
+    if (reason === 'manual') return { run: true, reason: 'manual run' };
+
+    const policy = s.autoRunPolicy || 'periodic_or_scene_cue';
+    if (policy === 'always') return { run: true, reason: 'policy: always' };
+
+    const currentUserCount = userMessageCount();
+    const interval = Math.max(1, Number(s.periodicUserMessages || 10));
+    const sinceLast = currentUserCount - Number(m.lastExtractionUserMessageCount || 0);
+    const periodicDue = sinceLast >= interval;
+    const marker = sceneMarkerDetected();
+    const cue = Boolean(s.sceneCuePrefilter) && deterministicSceneCueDetected();
+    const intervalReached = 'periodic interval reached (' + sinceLast + '/' + interval + ' user messages)';
+    const intervalNotReached = 'periodic interval not reached (' + sinceLast + '/' + interval + ' user messages)';
+
+    if (policy === 'periodic_only') {
+        return periodicDue ? { run: true, reason: intervalReached } : { run: false, reason: intervalNotReached };
+    }
+
+    if (policy === 'periodic_or_marker') {
+        if (marker) return { run: true, reason: 'scene marker detected' };
+        if (periodicDue) return { run: true, reason: intervalReached };
+        return { run: false, reason: 'no scene marker and ' + intervalNotReached };
+    }
+
+    if (marker) return { run: true, reason: 'scene marker detected' };
+    if (cue) return { run: true, reason: 'deterministic scene cue detected' };
+    if (periodicDue) return { run: true, reason: intervalReached };
+    return { run: false, reason: 'no scene cue/marker and ' + intervalNotReached };
 }
 
 function buildExtractorUserPayload() {
@@ -668,6 +745,20 @@ async function runExtraction(reason = 'manual') {
     const m = metadata();
     const sig = chatSignature();
 
+    if (reason !== 'manual') {
+        const gate = autoRunGate(reason);
+        if (!gate.run) {
+            m.skippedRuns = Number(m.skippedRuns || 0) + 1;
+            m.lastSkipReason = gate.reason;
+            await saveMetadataNow();
+            updatePanel();
+            updateUiStatus('ok', 'Auto-run skipped: ' + gate.reason);
+            logDebug('Auto-run skipped.', gate.reason);
+            return;
+        }
+        reason = reason + '; ' + gate.reason;
+    }
+
     if (inFlight) {
         queuedReason = reason;
         return;
@@ -701,6 +792,8 @@ async function runExtraction(reason = 'manual') {
         };
 
         m.lastProcessedSignature = sig;
+        m.lastExtractionUserMessageCount = userMessageCount();
+        m.lastSkipReason = '';
         m.lastRunAt = proposal.created_at;
         m.lastError = '';
         m.pendingProposals.unshift(proposal);
@@ -1081,6 +1174,10 @@ function updatePanel() {
     setInputValue('sfe_recent_limit', s.recentMessageLimit);
     setInputValue('sfe_max_tokens', s.maxTokens);
     setInputValue('sfe_trigger', s.trigger);
+    setInputValue('sfe_autorun_policy', s.autoRunPolicy);
+    setInputValue('sfe_periodic_user_messages', s.periodicUserMessages);
+    setInputValue('sfe_scene_cue_prefilter', s.sceneCuePrefilter, 'checked');
+    setInputValue('sfe_scene_marker_regex', s.sceneMarkerRegex);
     setInputValue('sfe_json_response', s.responseFormatJson, 'checked');
     setInputValue('sfe_strict_events', s.strictRecentEvents, 'checked');
     setInputValue('sfe_min_event_importance', s.minEventImportance);
@@ -1102,7 +1199,7 @@ function updatePanel() {
     const countEl = document.querySelector('#sfe_counts');
     if (countEl) {
         const pending = m.pendingProposals.filter(p => p.status === 'pending').length;
-        countEl.textContent = `Audit runs: ${m.auditLog.length} | pending: ${pending} | last run: ${m.lastRunAt || 'never'}`;
+        countEl.textContent = `Version: v${EXTENSION_VERSION} | Audit runs: ${m.auditLog.length} | pending: ${pending} | skipped: ${m.skippedRuns || 0} | last run: ${m.lastRunAt || 'never'} | last skip: ${m.lastSkipReason || 'none'}`;
     }
 
     if (m.lastError) updateUiStatus('bad', `Last error: ${m.lastError}`);
@@ -1132,11 +1229,13 @@ function installUi() {
     if (document.getElementById('sage_factoid_extractor_panel')) return;
     const html = `
 <div id="sage_factoid_extractor_panel" class="sfe-panel">
-  <h3>Sage Phase 1 Factoid Extractor</h3>
+  <h3>Sage Phase 1 Factoid Extractor <span class="sfe-version">v${EXTENSION_VERSION}</span></h3>
   <div class="sfe-small">Live extraction of proposed CurrentScene and RecentEvents deltas. Review-first by default.</div>
 
   <div class="sfe-row"><label><input id="sfe_enabled" type="checkbox"> Enabled</label><label><input id="sfe_autorun" type="checkbox"> Auto-run</label><label><input id="sfe_autoapply" type="checkbox"> Auto-apply proposed deltas</label><label><input id="sfe_debug" type="checkbox"> Debug console logging</label></div>
   <div class="sfe-row"><label for="sfe_trigger">Trigger</label><select id="sfe_trigger"><option value="assistant">After assistant reply</option><option value="user_and_assistant">After user and assistant messages</option></select></div>
+  <div class="sfe-row"><label for="sfe_autorun_policy">Auto-run policy</label><select id="sfe_autorun_policy"><option value="periodic_or_scene_cue">Periodic or scene cue</option><option value="periodic_or_marker">Periodic or explicit marker only</option><option value="periodic_only">Periodic only</option><option value="always">Always run on trigger</option></select><label for="sfe_periodic_user_messages">Every N user messages</label><input id="sfe_periodic_user_messages" type="number" min="1" max="50" step="1"><label><input id="sfe_scene_cue_prefilter" type="checkbox"> Scene cue prefilter</label></div>
+  <div class="sfe-row"><label for="sfe_scene_marker_regex">Scene marker regex</label><input id="sfe_scene_marker_regex" type="text" spellcheck="false"></div>
   <div class="sfe-row"><label for="sfe_endpoint">Extractor endpoint</label><input id="sfe_endpoint" type="text" spellcheck="false"></div>
   <div class="sfe-row"><label for="sfe_model">Model</label><input id="sfe_model" type="text" spellcheck="false"></div>
   <div class="sfe-row"><label for="sfe_apikey">API key</label><input id="sfe_apikey" type="text" spellcheck="false" placeholder="blank for LM Studio"></div>
@@ -1178,6 +1277,10 @@ function installUi() {
     bindSetting('sfe_recent_limit', 'recentMessageLimit', 'number');
     bindSetting('sfe_max_tokens', 'maxTokens', 'number');
     bindSetting('sfe_trigger', 'trigger');
+    bindSetting('sfe_autorun_policy', 'autoRunPolicy');
+    bindSetting('sfe_periodic_user_messages', 'periodicUserMessages', 'number');
+    bindSetting('sfe_scene_cue_prefilter', 'sceneCuePrefilter', 'boolean');
+    bindSetting('sfe_scene_marker_regex', 'sceneMarkerRegex');
     bindSetting('sfe_json_response', 'responseFormatJson', 'boolean');
     bindSetting('sfe_strict_events', 'strictRecentEvents', 'boolean');
     bindSetting('sfe_min_event_importance', 'minEventImportance', 'number');

@@ -1,4 +1,4 @@
-# Sage Phase 1 Factoid Extractor
+# Sage Phase 1 Factoid Extractor v0.1.11
 
 A review-first SillyTavern UI extension for the Sage continuity project.
 
@@ -11,7 +11,7 @@ It does **not** redesign the Sage card or preset. It does **not** build Data Ban
 
 ## Default behaviour
 
-- Auto-runs after assistant replies.
+- Auto-runs according to the selected policy. Default: periodic every 10 user messages or immediately on scene cue/marker.
 - Sends recent chat turns plus previous applied Phase 1 state to an extractor model.
 - Stores proposed JSON deltas in the current chat metadata and displays a plain-English review summary first.
 - Does not auto-apply deltas unless you enable `Auto-apply proposed deltas`.
@@ -49,8 +49,11 @@ Model: local-model
 API key: blank
 Temperature: 0
 Recent messages: 10
-Max output tokens: 900
+Max output tokens: 1200
 Request JSON response_format: off for first test
+Auto-run policy: Periodic or scene cue
+Every N user messages: 10
+Scene cue prefilter: on
 Auto-apply proposed deltas: off
 ```
 
@@ -153,4 +156,23 @@ If scene cues cause too many extractor calls, switch to:
 
 ```text
 Auto-run policy: Periodic or explicit marker only
+```
+
+
+## v0.1.11 throttle UI
+
+This build exposes the throttle controls in the panel:
+
+- Version badge in the panel title and counts/status row.
+- Auto-run policy.
+- Every N user messages.
+- Scene cue prefilter checkbox.
+- Scene marker regex.
+
+Default recommended policy:
+
+```text
+Auto-run policy: Periodic or scene cue
+Every N user messages: 10
+Scene cue prefilter: on
 ```

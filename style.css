@@ -60,3 +60,5 @@
 #sage_factoid_extractor_panel .sfe-buttons button {
   margin: 2px;
 }
+
+.sfe-version { font-size: 0.75em; opacity: 0.75; font-weight: normal; margin-left: 0.35em; }
