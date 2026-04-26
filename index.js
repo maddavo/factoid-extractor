@@ -1,5 +1,5 @@
 // Sage Phase 1 Factoid Extractor for SillyTavern
-// v0.1.5 — stricter RecentEvents gate; scene/object extraction unchanged.
+// v0.1.6 — robust near-JSON parsing and stricter RecentEvents rendering/pruning.
 
 const MODULE_NAME = 'sage_phase1_factoid_extractor';
 const MODULE_TITLE = 'Sage Phase 1 Factoid Extractor';
@@ -142,7 +142,8 @@ function defaultMetadata() {
         auditLog: [],
         lastProcessedSignature: '',
         lastRunAt: null,
-        lastError: ''
+        lastError: '',
+        lastRawExtractorText: ''
     };
 }
 
@@ -326,6 +327,8 @@ function buildLmStudioJsonSchemaResponseFormat() {
     };
 }
 
+let lastRawExtractorContent = "";
+
 async function callExtractor(promptPayload) {
     const s = settings();
     const headers = { 'Content-Type': 'application/json' };
@@ -359,22 +362,53 @@ async function callExtractor(promptPayload) {
 
     const data = await response.json();
     const content = data?.choices?.[0]?.message?.content ?? data?.choices?.[0]?.text ?? '';
+    lastRawExtractorContent = String(content || '');
     if (!content) throw new Error('Extractor returned no content.');
     return parseJsonContent(content);
 }
 
 function parseJsonContent(content) {
-    let text = String(content || '').trim();
-    text = text.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
-    try { return JSON.parse(text); } catch {}
+    let text = stripJsonFences(String(content || '').trim());
+    const candidates = [];
+    if (text) candidates.push(text);
 
     const first = text.indexOf('{');
     const last = text.lastIndexOf('}');
-    if (first >= 0 && last > first) {
-        const candidate = text.slice(first, last + 1);
-        return JSON.parse(candidate);
+    if (first >= 0 && last > first) candidates.push(text.slice(first, last + 1));
+
+    const errors = [];
+    for (const candidate of candidates) {
+        try { return JSON.parse(candidate); } catch (error) { errors.push(error?.message || String(error)); }
+        const repaired = repairNearJson(candidate);
+        if (repaired !== candidate) {
+            try { return JSON.parse(repaired); } catch (error) { errors.push(error?.message || String(error)); }
+        }
     }
-    throw new Error(`Could not parse extractor JSON: ${text.slice(0, 300)}`);
+
+    const detail = errors.length ? ` Parser details: ${errors[errors.length - 1]}` : '';
+    throw new Error(`Could not parse extractor JSON.${detail} Raw: ${text.slice(0, 500)}`);
+}
+
+function stripJsonFences(text) {
+    return String(text || '')
+        .replace(/^\s*```(?:json)?\s*/i, '')
+        .replace(/\s*```\s*$/i, '')
+        .trim();
+}
+
+function repairNearJson(text) {
+    let s = stripJsonFences(text);
+    s = s.replace(/^\uFEFF/, '');
+    // Remove common JavaScript-style comments outside strict JSON. This is intentionally simple and only used after strict parse fails.
+    s = s.replace(/\/\*[\s\S]*?\*\//g, '');
+    s = s.replace(/(^|\s)\/\/.*$/gm, '$1');
+    // LM Studio/local models often emit trailing commas, which cause: "Expected double-quoted property name".
+    s = s.replace(/,\s*([}\]])/g, '$1');
+    // Tolerate bare object keys from near-JSON, e.g. {scene_update: {...}}.
+    s = s.replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_\-]*)\s*:/g, '$1"$2":');
+    // Tolerate Python-ish constants occasionally emitted by local models.
+    s = s.replace(/:\s*None\b/g, ': null').replace(/:\s*True\b/g, ': true').replace(/:\s*False\b/g, ': false');
+    return s.trim();
 }
 
 function normalizeProposal(raw) {
@@ -409,7 +443,7 @@ function normalizeProposal(raw) {
         const minImportance = Number(settings().minEventImportance || 4);
         const maxEvents = Math.max(0, Number(settings().maxEventsPerProposal || 1));
         for (const ev of normalized.recent_event_updates) {
-            const gate = eventGateReason(ev, minImportance);
+            const gate = eventGateReason(ev, minImportance, normalized.scene_update);
             if (gate) {
                 rejectedEventCandidates.push({
                     candidate: ev.summary || ev.causal_result || '(recent event candidate)',
@@ -462,7 +496,7 @@ function normalizeProposal(raw) {
     return normalized;
 }
 
-function eventGateReason(event, minImportance) {
+function eventGateReason(event, minImportance, sceneUpdate = null) {
     const summary = sanitizeText(event?.summary);
     const result = sanitizeText(event?.causal_result);
     const evidence = sanitizeText(event?.evidence);
@@ -473,21 +507,57 @@ function eventGateReason(event, minImportance) {
     if (score < minImportance) return `Dropped RecentEvent candidate: importance ${score} below strict threshold ${minImportance}.`;
 
     const combined = `${summary} ${result}`.toLowerCase();
-    const weakPatterns = [
-        /\b(smile|smiled|grin|grinned|laugh|laughed|chuckle|chuckled|blush|blushed|sigh|sighed)\b/,
-        /\b(tease|teased|banter|flirt|flirted|joke|joked)\b/,
-        /\b(asked|said|told|replied|responded|commented|mentioned)\b/,
-        /\b(looked at|glanced|nodded|shrugged)\b/
+
+    const unresolvedPracticalPatterns = [
+        /\b(broke|broken|breaks|damaged|damage|lost|missing|can't find|cannot find|not found|hid|hidden|stolen)\b/,
+        /\b(promised|promise|agreed to|agreement|asked .* to|requested|request|task|deadline|urgent|must|needs to|need to|has to|still needs)\b/,
+        /\b(plan changed|change of plan|new plan|remind|remember|waiting for|depends on|blocked|can't continue|cannot continue|owe|owed|due)\b/,
+        /\b(interrupted by|alarm|phone call|knock at the door|emergency)\b/
     ];
-    const strongPatterns = [
-        /\b(broke|broken|breaks|lost|missing|can't find|cannot find|found|hid|hidden|moved|put|placed|handed|gave|took|left|entered|arrived)\b/,
-        /\b(promised|agreed to|needs to|need to|must|deadline|urgent|interrupted|task|plan changed|change of plan|remind|remember)\b/,
-        /\b(waiting for|depends on|blocked|can't continue|cannot continue|unresolved|still needs|has to)\b/
-    ];
-    const hasStrongCue = strongPatterns.some(re => re.test(combined));
-    const onlyWeakCue = weakPatterns.some(re => re.test(combined)) && !hasStrongCue;
-    if (onlyWeakCue) return 'Dropped RecentEvent candidate: appears to be ordinary dialogue, emotional colour, or banter rather than an unresolved practical event.';
+    const hasUnresolvedPracticalCue = unresolvedPracticalPatterns.some(re => re.test(combined));
+    if (!hasUnresolvedPracticalCue) {
+        return 'Dropped RecentEvent candidate: no clear unresolved task/problem/changed-plan consequence beyond CurrentScene.';
+    }
+
+    if (sceneUpdate && eventDuplicatesSceneDelta(event, sceneUpdate)) {
+        return 'Dropped RecentEvent candidate: already captured by CurrentScene/object state.';
+    }
+
     return '';
+}
+
+function eventDuplicatesSceneDelta(event, sceneUpdate) {
+    const combined = `${event?.summary || ''} ${event?.causal_result || ''}`.toLowerCase();
+    const objectUpdates = Array.isArray(sceneUpdate?.nearby_objects_add_or_update) ? sceneUpdate.nearby_objects_add_or_update : [];
+    const objectRemoves = Array.isArray(sceneUpdate?.nearby_objects_remove) ? sceneUpdate.nearby_objects_remove.map(objectRemoveName) : [];
+    for (const obj of objectUpdates) {
+        const name = sanitizeText(obj?.name).toLowerCase();
+        if (name && combined.includes(name)) return true;
+    }
+    for (const nameRaw of objectRemoves) {
+        const name = sanitizeText(nameRaw).toLowerCase();
+        if (name && combined.includes(name)) return true;
+    }
+    if (sceneUpdate?.location_ref && /\b(location|setting|scene|arrives?|returns?|leaves?|enters?)\b/.test(combined)) return true;
+    if ((sceneUpdate?.present_entities_add?.length || sceneUpdate?.present_entities_remove?.length) && /\b(arrives?|returns?|leaves?|enters?|present|alone)\b/.test(combined)) return true;
+    return false;
+}
+
+function eventRenderable(event) {
+    if (!event || event.resolved) return false;
+    if (!settings().strictRecentEvents) return true;
+    return !eventGateReason(event, Number(settings().minEventImportance || 4), null);
+}
+
+function pruneStoredRecentEvents() {
+    const m = metadata();
+    const before = (m.recentEvents || []).length;
+    m.recentEvents = (m.recentEvents || []).filter(eventRenderable);
+    const maxEvents = Math.max(1, Number(settings().unresolvedEventLimit || 6));
+    m.recentEvents = m.recentEvents.slice(0, maxEvents);
+    saveMetadataNow();
+    updatePanel();
+    toastInfo(`Pruned ${before - m.recentEvents.length} stored RecentEvent(s).`);
 }
 
 function hasSubstantiveDelta(delta) {
@@ -572,6 +642,7 @@ async function runExtraction(reason = 'manual') {
     } catch (error) {
         console.error(`[${MODULE_TITLE}]`, error);
         metadata().lastError = String(error?.message || error);
+        metadata().lastRawExtractorText = lastRawExtractorContent || '';
         await saveMetadataNow();
         updatePanel();
         updateUiStatus('bad', `Extractor error: ${metadata().lastError}`);
@@ -667,7 +738,9 @@ function applyProposalObject(proposal) {
 
     const maxEvents = Math.max(1, Number(settings().unresolvedEventLimit || 6));
     if (!settings().keepResolvedEvents) {
-        m.recentEvents = m.recentEvents.filter(e => !e.resolved).slice(0, maxEvents);
+        m.recentEvents = m.recentEvents.filter(eventRenderable).slice(0, maxEvents);
+    } else if (settings().strictRecentEvents) {
+        m.recentEvents = m.recentEvents.filter(e => e.resolved || eventRenderable(e)).slice(0, Math.max(maxEvents, 12));
     } else {
         m.recentEvents = m.recentEvents.slice(0, Math.max(maxEvents, 12));
     }
@@ -732,7 +805,7 @@ function renderPackets() {
     if (scene.surroundings_summary) sceneLines.push(`Surroundings: ${scene.surroundings_summary}`);
 
     const eventLines = (m.recentEvents || [])
-        .filter(e => !e.resolved)
+        .filter(eventRenderable)
         .slice(0, Number(settings().unresolvedEventLimit || 6))
         .map(e => e.causal_result ? `${e.summary}; result: ${e.causal_result}` : e.summary);
 
@@ -940,7 +1013,7 @@ function updatePanel() {
     if (summaryPre) summaryPre.textContent = renderProposalSummary(latest);
 
     const proposalPre = document.querySelector('#sfe_latest_proposal');
-    if (proposalPre) proposalPre.textContent = latest ? JSON.stringify(latest, null, 2) : 'No extractor output yet.';
+    if (proposalPre) proposalPre.textContent = latest ? JSON.stringify(latest, null, 2) : (m.lastRawExtractorText ? `Last raw extractor text from failed parse:\n${m.lastRawExtractorText}` : 'No extractor output yet.');
 
     const statePre = document.querySelector('#sfe_state_preview');
     if (statePre) statePre.textContent = JSON.stringify({ currentScene: m.currentScene, recentEvents: m.recentEvents }, null, 2);
@@ -999,6 +1072,7 @@ function installUi() {
     <button id="sfe_copy_summary" class="menu_button">Copy review summary</button>
     <button id="sfe_copy_latest" class="menu_button">Copy latest JSON</button>
     <button id="sfe_copy_packets" class="menu_button">Copy OOC packet preview</button>
+    <button id="sfe_prune_events" class="menu_button">Prune weak RecentEvents</button>
     <button id="sfe_export_json" class="menu_button">Export audit JSON</button>
     <button id="sfe_export_md" class="menu_button">Export controller MD</button>
     <button id="sfe_reset" class="menu_button">Reset chat state</button>
@@ -1051,6 +1125,7 @@ function installUi() {
     document.getElementById('sfe_copy_summary')?.addEventListener('click', () => copyToClipboard(renderProposalSummary(latestProposal())));
     document.getElementById('sfe_copy_latest')?.addEventListener('click', () => copyToClipboard(JSON.stringify(latestProposal() || {}, null, 2)));
     document.getElementById('sfe_copy_packets')?.addEventListener('click', () => copyToClipboard(renderPackets()));
+    document.getElementById('sfe_prune_events')?.addEventListener('click', () => pruneStoredRecentEvents());
     document.getElementById('sfe_export_json')?.addEventListener('click', exportAuditJson);
     document.getElementById('sfe_export_md')?.addEventListener('click', exportControllerMarkdown);
     document.getElementById('sfe_reset')?.addEventListener('click', resetState);

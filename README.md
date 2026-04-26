@@ -117,3 +117,11 @@ This is a live extraction test harness, not a final continuity system. A viabili
 - Drops event candidates with no causal result, no evidence, weak emotional/banter/dialogue cues, or low importance.
 - Scene/object extraction and grouped object-location packet rendering are unchanged.
 - Added UI controls: `Strict RecentEvents gate`, `Min event importance`, and `Max events/proposal`.
+
+
+## v0.1.6 changes
+
+- Adds tolerant near-JSON repair for common local-model output errors such as trailing commas.
+- Saves raw extractor text after a parse failure for debugging.
+- Tightens RecentEvents rendering so old low-importance events are hidden from packet preview when strict gating is enabled.
+- Adds a `Prune weak RecentEvents` button to remove already-stored weak events from this chat's metadata.
