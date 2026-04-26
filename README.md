@@ -125,3 +125,10 @@ This is a live extraction test harness, not a final continuity system. A viabili
 - Saves raw extractor text after a parse failure for debugging.
 - Tightens RecentEvents rendering so old low-importance events are hidden from packet preview when strict gating is enabled.
 - Adds a `Prune weak RecentEvents` button to remove already-stored weak events from this chat's metadata.
+
+## v0.1.8 notes
+
+- Repairs Markdown-emphasised JSON keys such as `*importance_score*: 4`.
+- Filters body parts and transient physical contact from `nearby_objects`.
+- Suppresses duplicate RecentEvents that are already stored.
+- Keeps strict RecentEvents behaviour from v0.1.7.

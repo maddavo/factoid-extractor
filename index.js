@@ -1,5 +1,5 @@
 // Sage Phase 1 Factoid Extractor for SillyTavern
-// v0.1.6 — robust near-JSON parsing and stricter RecentEvents rendering/pruning.
+// v0.1.8 — markdown-key JSON repair, body-part object filtering, and duplicate event suppression.
 
 const MODULE_NAME = 'sage_phase1_factoid_extractor';
 const MODULE_TITLE = 'Sage Phase 1 Factoid Extractor';
@@ -12,7 +12,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     model: 'local-model',
     apiKey: '',
     temperature: 0,
-    maxTokens: 900,
+    maxTokens: 1200,
     recentMessageLimit: 10,
     debounceMs: 1500,
     responseFormatJson: false,
@@ -41,7 +41,7 @@ PHASE 1 STATE ONLY:
 1. CurrentScene:
 - current location
 - currently present people/entities
-- nearby practical objects
+- nearby practical objects only; do not store body parts, poses, grips, touches, gazes, kisses, or transient contact as objects
 - object locations
 - one short surroundings summary only if it materially anchors the scene
 
@@ -72,6 +72,7 @@ STRICT RULES:
 - Cap output to the most important Phase 1 facts. Sparse is better than complete.
 - If only ordinary conversation happened, set recent_event_updates to [] and explain rejected candidates if useful.
 - Output valid JSON only. No Markdown. No prose outside JSON.
+- Never wrap property names in asterisks or Markdown emphasis. Use "importance_score": 4, never *importance_score*: 4.
 
 OUTPUT SHAPE:
 {
@@ -111,7 +112,14 @@ OUTPUT SHAPE:
 Use null or empty arrays for no change.
 For nearby_objects_add_or_update, use objects like {"name":"Davo's mug","location":"Sage's study desk","evidence":"Turn 14: ..."}.
 For RecentEvents, causal_result is mandatory: describe the unresolved practical consequence. If no unresolved practical consequence exists, do not create the event.
-Evidence must point to source turn numbers or short quotes from the chat text.`;
+Evidence must point to source turn numbers or short quotes from the chat text.
+
+CRITICAL JSON RELIABILITY RULES:
+- Always include all five top-level keys: scene_update, recent_event_updates, resolved_event_updates, rejected_candidates, no_update_reason.
+- If there are no events, still output "recent_event_updates": [] and "resolved_event_updates": [].
+- End with a complete closing brace.
+- Do not leave a dangling comma after scene_update.
+- Every object key must be double-quoted plain text, e.g. "importance_score". Do not use *importance_score*.`;
 
 function ctx() {
     return globalThis.SillyTavern?.getContext?.() || {};
@@ -200,6 +208,28 @@ function objectRemoveName(value) {
     if (typeof value === 'string') return sanitizeText(value);
     if (!value || typeof value !== 'object') return '';
     return sanitizeText(value.name ?? value.object ?? value.object_name ?? value.item ?? value.label ?? value.target ?? value.current_name ?? '');
+}
+
+function sceneObjectGateReason(obj) {
+    const name = sanitizeText(obj?.name);
+    const location = sanitizeText(obj?.location);
+    if (!name && !location) return 'Dropped scene object candidate: missing object name/location.';
+
+    const nameLower = name.toLowerCase();
+    const locationLower = location.toLowerCase();
+
+    // Nearby objects are practical external anchors. Body parts and momentary contact points are not useful scene objects.
+    const bodyPartPattern = /\b(waist|chest|hand|hands|finger|fingers|arm|arms|shoulder|shoulders|lips|mouth|eyes|gaze|hair|face|neck|hip|hips|back|breath|body|skin)\b/;
+    if (bodyPartPattern.test(nameLower)) {
+        return 'Dropped scene object candidate: body parts/transient contact are not nearby practical objects.';
+    }
+
+    const transientLocationPattern = /\b(grasp|embrace|kiss|touch|hold|holding|hands|arms|lap|chest|waist)\b/;
+    if (transientLocationPattern.test(locationLower) && !/\b(chair|desk|table|floor|door|bed|shelf|counter|room|wall)\b/.test(locationLower)) {
+        return 'Dropped scene object candidate: transient physical contact is not a stable object location.';
+    }
+
+    return '';
 }
 
 function roleOfMessage(message) {
@@ -383,10 +413,17 @@ function parseJsonContent(content) {
         if (repaired !== candidate) {
             try { return JSON.parse(repaired); } catch (error) { errors.push(error?.message || String(error)); }
         }
+        const completed = completeTruncatedRootJson(repaired);
+        if (completed !== repaired) {
+            try { return JSON.parse(completed); } catch (error) { errors.push(error?.message || String(error)); }
+        }
     }
 
+    const salvaged = salvagePartialProposal(text);
+    if (salvaged) return salvaged;
+
     const detail = errors.length ? ` Parser details: ${errors[errors.length - 1]}` : '';
-    throw new Error(`Could not parse extractor JSON.${detail} Raw: ${text.slice(0, 500)}`);
+    throw new Error(`Could not parse extractor JSON.${detail} Raw: ${text.slice(0, 1000)}`);
 }
 
 function stripJsonFences(text) {
@@ -402,13 +439,80 @@ function repairNearJson(text) {
     // Remove common JavaScript-style comments outside strict JSON. This is intentionally simple and only used after strict parse fails.
     s = s.replace(/\/\*[\s\S]*?\*\//g, '');
     s = s.replace(/(^|\s)\/\/.*$/gm, '$1');
+    // LM Studio/local models sometimes emit Markdown-emphasised keys such as *importance_score*: 4.
+    s = s.replace(/([{,]\s*)["']?\*+\s*([A-Za-z_][A-Za-z0-9_\-]*)\s*\*+["']?\s*:/g, '$1"$2":');
     // LM Studio/local models often emit trailing commas, which cause: "Expected double-quoted property name".
     s = s.replace(/,\s*([}\]])/g, '$1');
+    // Tolerate a dangling comma at EOF from incomplete top-level output.
+    s = s.replace(/,\s*$/g, '');
     // Tolerate bare object keys from near-JSON, e.g. {scene_update: {...}}.
     s = s.replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_\-]*)\s*:/g, '$1"$2":');
     // Tolerate Python-ish constants occasionally emitted by local models.
     s = s.replace(/:\s*None\b/g, ': null').replace(/:\s*True\b/g, ': true').replace(/:\s*False\b/g, ': false');
     return s.trim();
+}
+
+function completeTruncatedRootJson(text) {
+    let s = stripJsonFences(text || '').trim();
+    if (!s.startsWith('{')) return s;
+    // If the model emitted only {"scene_update": {...}, add the missing empty top-level fields.
+    if (/"scene_update"\s*:/.test(s) && !/"recent_event_updates"\s*:/.test(s)) {
+        s = s.replace(/,\s*$/g, '');
+        s += ',"recent_event_updates":[],"resolved_event_updates":[],"rejected_candidates":[],"no_update_reason":""}';
+        return repairNearJson(s);
+    }
+    return s;
+}
+
+function salvagePartialProposal(text) {
+    const scene = extractJsonValueForKey(text, 'scene_update');
+    if (!scene) return null;
+    let sceneObj = null;
+    try { sceneObj = JSON.parse(repairNearJson(scene)); } catch { return null; }
+    return {
+        scene_update: sceneObj,
+        recent_event_updates: [],
+        resolved_event_updates: [],
+        rejected_candidates: [
+            {
+                candidate: 'Extractor returned incomplete top-level JSON after scene_update.',
+                reason: 'Recovered complete scene_update and treated missing RecentEvents fields as empty.'
+            }
+        ],
+        no_update_reason: ''
+    };
+}
+
+function extractJsonValueForKey(text, key) {
+    const src = repairNearJson(text || '');
+    const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp('"' + escapedKey + '"\\s*:\\s*');
+    const m = re.exec(src);
+    if (!m) return null;
+    let i = m.index + m[0].length;
+    while (i < src.length && /\s/.test(src[i])) i++;
+    const open = src[i];
+    const close = open === '{' ? '}' : open === '[' ? ']' : null;
+    if (!close) return null;
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let j = i; j < src.length; j++) {
+        const ch = src[j];
+        if (inStr) {
+            if (esc) esc = false;
+            else if (ch === '\\') esc = true;
+            else if (ch === '"') inStr = false;
+            continue;
+        }
+        if (ch === '"') { inStr = true; continue; }
+        if (ch === open) depth++;
+        else if (ch === close) {
+            depth--;
+            if (depth === 0) return src.slice(i, j + 1);
+        }
+    }
+    return null;
 }
 
 function normalizeProposal(raw) {
@@ -477,13 +581,27 @@ function normalizeProposal(raw) {
         .filter(e => e && (e.candidate || e.reason))
         .map(e => ({ candidate: sanitizeText(e.candidate), reason: sanitizeText(e.reason) }));
 
-    normalized.scene_update.nearby_objects_add_or_update = normalized.scene_update.nearby_objects_add_or_update
-        .filter(o => o && (o.name || o.location))
-        .map(o => ({
-            name: sanitizeText(o.name),
-            location: sanitizeText(o.location),
-            evidence: sanitizeText(o.evidence)
-        }));
+    const keptObjectUpdates = [];
+    const rejectedObjectCandidates = [];
+    for (const rawObj of normalized.scene_update.nearby_objects_add_or_update) {
+        if (!rawObj || !(rawObj.name || rawObj.location)) continue;
+        const obj = {
+            name: sanitizeText(rawObj.name),
+            location: sanitizeText(rawObj.location),
+            evidence: sanitizeText(rawObj.evidence)
+        };
+        const gate = sceneObjectGateReason(obj);
+        if (gate) {
+            rejectedObjectCandidates.push({
+                candidate: obj.name || obj.location || '(scene object candidate)',
+                reason: gate
+            });
+        } else {
+            keptObjectUpdates.push(obj);
+        }
+    }
+    normalized.scene_update.nearby_objects_add_or_update = keptObjectUpdates;
+    normalized.rejected_candidates.push(...rejectedObjectCandidates);
 
     normalized.scene_update.nearby_objects_remove = normalized.scene_update.nearby_objects_remove
         .map(objectRemoveName)
@@ -505,6 +623,14 @@ function eventGateReason(event, minImportance, sceneUpdate = null) {
     if (!result) return 'Dropped RecentEvent candidate: no unresolved practical causal result.';
     if (!evidence) return 'Dropped RecentEvent candidate: no source evidence.';
     if (score < minImportance) return `Dropped RecentEvent candidate: importance ${score} below strict threshold ${minImportance}.`;
+
+    const existingEvents = Array.isArray(metadata()?.recentEvents) ? metadata().recentEvents : [];
+    for (const existing of existingEvents) {
+        const existingSummary = sanitizeText(existing?.summary);
+        if (existingSummary && (sameText(existingSummary, summary) || existingSummary.toLowerCase().includes(summary.toLowerCase()) || summary.toLowerCase().includes(existingSummary.toLowerCase()))) {
+            return 'Dropped RecentEvent candidate: already stored in RecentEvents.';
+        }
+    }
 
     const combined = `${summary} ${result}`.toLowerCase();
 
