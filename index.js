@@ -1,7 +1,7 @@
 // Sage Phase 1 Factoid Extractor for SillyTavern
-// v0.1.15 — high-salience event triggers and relationship-status RecentEvents.
+// v0.1.17 — durable relationship/role status event gate.
 
-const EXTENSION_VERSION = '0.1.15';
+const EXTENSION_VERSION = '0.1.17';
 
 const MODULE_NAME = 'sage_phase1_factoid_extractor';
 const MODULE_TITLE = 'Sage Phase 1 Factoid Extractor';
@@ -30,6 +30,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     minEventImportance: 4,
     maxEventsPerProposal: 1,
     clearRoomObjectsOnLocationChange: true,
+    surroundingsUpdateMode: 'location_only', // location_only | normal
     debug: false
 });
 
@@ -52,12 +53,13 @@ PHASE 1 STATE ONLY:
 - nearby practical objects
 - object locations
 - one short surroundings summary only if it materially anchors the scene
+- surroundings_summary should be stable environmental context, not body/pose/blocking description
 
 2. RecentEvents:
 - only rare, high-salience facts Sage must remember in the next several turns
 - normally use RecentEvents only when there is a clear unresolved consequence not already captured by CurrentScene
 - exception: major relationship/status changes are valid RecentEvents even if they are not an unresolved task, because Phase 1 has no RelationshipState object yet
-- examples that usually qualify: object broken and still matters, important item lost and not found, explicit promise/request/task/deadline, urgent interruption, a plan changed with unresolved next action, factual reminder that must affect the next response, explicit girlfriend/boyfriend/partner/relationship status change
+- examples that usually qualify: object broken and still matters, important item lost and not found, explicit promise/request/task/deadline, urgent interruption, a plan changed with unresolved next action, factual reminder that must affect the next response, explicit girlfriend/boyfriend/partner/relationship status change, explicit persistent relationship/role designation such as master/mistress/dominant/submissive/owner if the chat clearly treats it as an ongoing status
 - examples that usually do NOT qualify: ordinary dialogue progress, greetings, banter, flirtation, emotional colour, a normal question/answer, a minor observation, scene transition already stored in CurrentScene, object placement/movement already stored in CurrentScene, person entered/left already reflected in present_entities, completed handover with no unresolved consequence
 
 STRICT RULES:
@@ -69,13 +71,16 @@ STRICT RULES:
 - For nearby_objects_remove, output only the object name as a string, never an object.
 - Avoid pronouns in stored facts.
 - Do not store mood as a scene fact.
+- Do not update surroundings_summary for sexual/body-position/blocking changes, touch/grab/kiss/intensity/mood/decorative detail, or ordinary physical interaction.
+- Only update surroundings_summary when location_ref changes, sub-location changes, or a stable practical environmental anchor changes, such as door locked/open/closed, lights on/off, shower running, bed broken, room flooded, fire/smoke/alarm, window open/closed, etc.
 - Do not store generic flirt lines, banter, emotional colour, ordinary replies, questions, acknowledgements, or decorative ambience as RecentEvents.
 - If one character asks for a committed relationship and the other explicitly accepts, store one RecentEvent with importance_score 5, e.g. "Sage accepted Davo's request to be her boyfriend/girlfriend/partner; their relationship status changed."
+- If a character explicitly designates a durable relationship/role/status label, store one RecentEvent with importance_score 5, e.g. "Sage explicitly designated Davo as her master; their relationship/role status changed." Treat it as durable until later explicit text countermands/cancels it. Do not store it if it is clearly temporary, joking, hypothetical, or only body-position/scene flavour.
 - Do not turn every response into a RecentEvent. RecentEvents should be rare.
 - Do not duplicate CurrentScene in RecentEvents. If the scene/object state already captures the change, leave recent_event_updates empty unless there is a still-unresolved practical consequence.
 - Do not output no-op scene updates. If an object is already recorded at the same location, do not add/update it again.
 - Do not output both add/update and remove for the same object in one proposal. If the object is still present, do not remove it.
-- A RecentEvent must pass this gate: would omitting it likely cause Sage to contradict an unresolved task, obligation, broken/lost item, urgent interruption, changed plan, or major relationship/status change within the next 5-10 turns? If no, do not extract it.
+- A RecentEvent must pass this gate: would omitting it likely cause Sage to contradict an unresolved task, obligation, broken/lost item, urgent interruption, changed plan, or major relationship/status change, or durable relationship/role designation within the next 5-10 turns? If no, do not extract it.
 - For RecentEvents, importance_score uses 0-5. Output only importance_score 4 or 5 events.
 - Output at most one new RecentEvent per extraction pass. If several candidates exist, keep only the most practically urgent one.
 - Do not treat decorative assistant narration as authoritative when it invents unsupported details.
@@ -301,7 +306,7 @@ function highSalienceEventCueDetected() {
     const text = recentChatText(10).toLowerCase();
     if (!text) return false;
 
-    const relationshipCue = /\b(girlfriend|boyfriend|partner|relationship|dating|date me|go out with me|be with me|be my|official|couple)\b/i;
+    const relationshipCue = /\b(girlfriend|boyfriend|partner|relationship|dating|date me|go out with me|be with me|be my|official|couple|master|mistress|dominant|submissive|dom\b|sub\b|owner|owned by|belong to|belongs to|claim me|claimed me|collar|collared)\b/i;
     const acceptanceCue = /\b(yes|okay|ok|accepted?|agreed?|i will|i do|of course|let's|we are|we're|i'd like that|i want that)\b/i;
     const commitmentCue = /\b(promised|promise|agreed to|agreement|deal|plan changed|new plan|deadline|urgent|important|remember|remind me|don't forget|owe|waiting for|depends on|blocked|lost|missing|broken|stolen|hidden)\b/i;
 
@@ -519,6 +524,10 @@ function repairNearJson(text) {
     s = s.replace(/(^|\s)\/\/.*$/gm, '$1');
     // LM Studio/local models often emit trailing commas, which cause: "Expected double-quoted property name".
     s = s.replace(/,\s*([}\]])/g, '$1');
+    // Tolerate Markdown-emphasised keys from local models, e.g. *importance_score*: 4 or **key**: value.
+    s = s.replace(/([{,]\s*)\*\*([A-Za-z_][A-Za-z0-9_\-]*)\*\*\s*:/g, '$1\"$2\":');
+    s = s.replace(/([{,]\s*)\*([A-Za-z_][A-Za-z0-9_\-]*)\*\s*:/g, '$1\"$2\":');
+    s = s.replace(/([{,]\s*)\"\*\*?([A-Za-z_][A-Za-z0-9_\-]*)\*?\*\"\s*:/g, '$1\"$2\":');
     // Tolerate a dangling comma at EOF from incomplete top-level output.
     s = s.replace(/,\s*$/g, '');
     // Tolerate bare object keys from near-JSON, e.g. {scene_update: {...}}.
@@ -673,9 +682,54 @@ function normalizeProposal(raw) {
     if (normalized.scene_update.location_ref !== null) normalized.scene_update.location_ref = sanitizeText(normalized.scene_update.location_ref);
     if (normalized.scene_update.surroundings_summary !== null) normalized.scene_update.surroundings_summary = sanitizeText(normalized.scene_update.surroundings_summary);
 
+    filterSurroundingsDelta(normalized);
     return filterNoOpSceneDelta(normalized);
 }
 
+
+function filterSurroundingsDelta(delta) {
+    const su = delta?.scene_update || {};
+    if (su.surroundings_summary === null || su.surroundings_summary === undefined || su.surroundings_summary === '') return delta;
+    const mode = settings().surroundingsUpdateMode || 'location_only';
+    if (mode === 'normal') return delta;
+
+    const current = metadata().currentScene || EMPTY_SCENE;
+    const nextLocation = sanitizeText(su.location_ref);
+    const currentLocation = sanitizeText(current.location_ref);
+    const locationChanges = Boolean(nextLocation && currentLocation && !sameText(nextLocation, currentLocation));
+    const initialLocationSet = Boolean(nextLocation && !currentLocation);
+    const summary = sanitizeText(su.surroundings_summary);
+
+    if (locationChanges || initialLocationSet) return delta;
+    if (isStableEnvironmentSurroundings(summary)) return delta;
+
+    const reason = isTransientBodyOrInteractionSummary(summary)
+        ? 'Suppressed surroundings update: body position/touch/intensity/blocking changes are not stable scene surroundings.'
+        : 'Suppressed surroundings update: location-only mode allows surroundings changes only for location/sub-location or stable environmental anchors.';
+    su.surroundings_summary = null;
+    delta.rejected_candidates = [
+        ...(delta.rejected_candidates || []),
+        { candidate: `Surroundings: ${summary}`, reason }
+    ];
+    if (!hasSubstantiveDelta(delta) && !delta.no_update_reason) {
+        delta.no_update_reason = 'Only a non-stable surroundings change was proposed.';
+    }
+    return delta;
+}
+
+function isStableEnvironmentSurroundings(text) {
+    const t = sanitizeText(text).toLowerCase();
+    if (!t) return false;
+    const stableEnvironment = /\b(door|window|lock|locked|unlocked|open|opened|closed|shut|lights?|dark|lit|lamp|power|outage|shower|bathroom|water|running|faucet|tap|flood|flooded|smoke|fire|alarm|broken|breaks|damaged|spilled|spill|mess|blocked|barricaded|curtain|blind|heater|fan|air conditioner|ac)\b/;
+    const subLocation = /\b(bathroom|shower|hallway|corridor|doorway|entrance|balcony|outside|inside|kitchen|office|garage|car|street|yard|library|cafeteria|classroom|bedroom)\b/;
+    return stableEnvironment.test(t) || subLocation.test(t);
+}
+
+function isTransientBodyOrInteractionSummary(text) {
+    const t = sanitizeText(text).toLowerCase();
+    if (!t) return false;
+    return /\b(kiss|kissing|touch|touching|grab|grabs|grabbing|hold|holds|holding|waist|hips?|chest|thigh|legs?|arms?|hands?|body|bodies|position|pose|posing|on top|underneath|behind|against him|against her|leaning|straddl|kneel|standing over|bent|press(?:ed|ing)?|intensity|tempo|rhythm|moan|sexual|intimate)\b/.test(t);
+}
 
 function filterNoOpSceneDelta(delta) {
     const m = metadata();
@@ -790,7 +844,8 @@ function eventGateReason(event, minImportance, sceneUpdate = null) {
     const combined = `${summary} ${result}`.toLowerCase();
 
     const relationshipStatusPattern = /\b(girlfriend|boyfriend|partner|relationship|dating|official|couple|accepted .* request|agreed .* relationship|relationship status changed|became .* girlfriend|became .* boyfriend|became .* partner)\b/;
-    const hasRelationshipStatusCue = relationshipStatusPattern.test(combined);
+    const roleStatusPattern = /\b(master|mistress|dominant|submissive|dom\b|sub\b|owner|owned by|belong to|belongs to|claimed by|claim(?:ed)? .* as|designat(?:ed|es) .* as|called .* master|calls .* master|relationship\/role status changed|role status changed)\b/;
+    const hasRelationshipStatusCue = relationshipStatusPattern.test(combined) || roleStatusPattern.test(combined);
 
     const unresolvedPracticalPatterns = [
         /\b(broke|broken|breaks|damaged|damage|lost|missing|can't find|cannot find|not found|hid|hidden|stolen)\b/,
@@ -1449,6 +1504,7 @@ function updatePanel() {
     setInputValue('sfe_min_event_importance', s.minEventImportance);
     setInputValue('sfe_max_events_per_proposal', s.maxEventsPerProposal);
     setInputValue('sfe_clear_objects_on_location_change', s.clearRoomObjectsOnLocationChange, 'checked');
+    setInputValue('sfe_surroundings_mode', s.surroundingsUpdateMode || 'location_only');
 
     const latest = reviewProposal();
     const summaryPre = document.querySelector('#sfe_latest_summary');
@@ -1515,6 +1571,7 @@ function installUi() {
   <div class="sfe-row"><label for="sfe_recent_limit">Recent messages</label><input id="sfe_recent_limit" type="number" min="2" max="40" step="1"><label for="sfe_max_tokens">Max output tokens</label><input id="sfe_max_tokens" type="number" min="100" max="4000" step="50"><label><input id="sfe_json_response" type="checkbox"> Request JSON response_format</label></div>
   <div class="sfe-row"><label><input id="sfe_strict_events" type="checkbox"> Strict RecentEvents gate</label><label for="sfe_min_event_importance">Min event importance</label><input id="sfe_min_event_importance" type="number" min="0" max="5" step="1"><label for="sfe_max_events_per_proposal">Max events/proposal</label><input id="sfe_max_events_per_proposal" type="number" min="0" max="3" step="1"></div>
   <div class="sfe-row"><label><input id="sfe_clear_objects_on_location_change" type="checkbox"> Expire old room objects on location change</label><span class="sfe-small">Recommended on: prevents “The floor” objects from following Sage into a new room.</span></div>
+  <div class="sfe-row"><label for="sfe_surroundings_mode">Surroundings update mode</label><select id="sfe_surroundings_mode"><option value="location_only">Location/sub-location/environment only</option><option value="normal">Normal extractor output</option></select><span class="sfe-small">Default suppresses body-position, touch, intensity, mood, and decorative surroundings churn.</span></div>
 
   <div class="sfe-row sfe-buttons">
     <button id="sfe_run_now" class="menu_button">Run extraction now</button>
@@ -1563,6 +1620,7 @@ function installUi() {
     bindSetting('sfe_min_event_importance', 'minEventImportance', 'number');
     bindSetting('sfe_max_events_per_proposal', 'maxEventsPerProposal', 'number');
     bindSetting('sfe_clear_objects_on_location_change', 'clearRoomObjectsOnLocationChange', 'boolean');
+    bindSetting('sfe_surroundings_mode', 'surroundingsUpdateMode');
 
     document.getElementById('sfe_run_now')?.addEventListener('click', () => runExtraction('manual'));
     document.getElementById('sfe_apply_latest')?.addEventListener('click', async () => {
