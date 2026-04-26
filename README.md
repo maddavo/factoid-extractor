@@ -126,9 +126,31 @@ This is a live extraction test harness, not a final continuity system. A viabili
 - Tightens RecentEvents rendering so old low-importance events are hidden from packet preview when strict gating is enabled.
 - Adds a `Prune weak RecentEvents` button to remove already-stored weak events from this chat's metadata.
 
-## v0.1.8 notes
+## v0.1.10 / Extension v10 changes
 
-- Repairs Markdown-emphasised JSON keys such as `*importance_score*: 4`.
-- Filters body parts and transient physical contact from `nearby_objects`.
-- Suppresses duplicate RecentEvents that are already stored.
-- Keeps strict RecentEvents behaviour from v0.1.7.
+- Adds throttled extraction so the extractor no longer runs after every assistant reply by default.
+- New default policy: `Periodic or scene cue`.
+- New default periodic interval: every 10 user messages.
+- Adds a scene-change cue prefilter for common location-change wording such as enter/leave/return/arrive/go to/walk into.
+- Adds explicit scene marker detection using a configurable regex. Default markers include:
+  - `<!--SAP_SCENE_CHANGE-->`
+  - `<sap_scene_change/>`
+  - `[[SAP_SCENE_CHANGE]]`
+- Adds skipped-run accounting in the panel so the operator can see when auto-extraction was deliberately deferred.
+- Manual `Run extraction now` still always runs.
+
+Recommended test policy for latency reduction:
+
+```text
+Auto-run policy: Periodic or scene cue
+Every N user messages: 10
+Scene cue prefilter: on
+Trigger: After assistant reply
+Auto-apply: off
+```
+
+If scene cues cause too many extractor calls, switch to:
+
+```text
+Auto-run policy: Periodic or explicit marker only
+```
