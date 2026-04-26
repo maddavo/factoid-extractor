@@ -1,7 +1,7 @@
 // Sage Phase 1 Factoid Extractor for SillyTavern
-// v0.1.19 — near-JSON double-colon repair.
+// v0.1.20 — conservative object coalescing.
 
-const EXTENSION_VERSION = '0.1.19';
+const EXTENSION_VERSION = '0.1.20';
 
 const MODULE_NAME = 'sage_phase1_factoid_extractor';
 const MODULE_TITLE = 'Sage Phase 1 Factoid Extractor';
@@ -32,6 +32,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     maxEventsPerProposal: 1,
     clearRoomObjectsOnLocationChange: true,
     surroundingsUpdateMode: 'location_only', // location_only | normal
+    objectCoalescingMode: 'conservative', // conservative | off
     debug: false
 });
 
@@ -91,6 +92,7 @@ STRICT RULES:
 - For split-location remote communication, use schema-pure fields: set location_ref to a concise split scene such as "Split scene: Davo in HOTs kitchen; Sage in Exam Hall"; remove unqualified co-present entities such as "Davo" and "Sage Morgan-Burke" if they were previously present together; add qualified entities such as "Davo — local, HOTs kitchen" and "Sage Morgan-Burke — remote, Exam Hall, texting by phone"; put the communication mode in surroundings_summary, e.g. "Davo and Sage are communicating by text while physically separated."
 - For split-location scenes, object locations must include which physical side they belong to, e.g. "HOTs kitchen counter" or "Exam Hall desk". Do not use generic locations like "the floor" without a side/location.
 - If the current location/room changes, remove old room-local nearby_objects unless the object is explicitly carried into the new scene.
+- Coalesce interchangeable objects when they share the same current location/container. Prefer "$40 cash in Davo's pocket" over four separate "$10 cash from X" objects. Do not coalesce unique/personal/named objects such as phones, keys, notes, letters, weapons, evidence, gifts, clothing, bags, or identity-specific items.
 - If new explicit text contradicts old state, prefer the latest explicit fact and include a rejected_candidate or uncertainty note.
 - Cap output to the most important Phase 1 facts. Sparse is better than complete.
 - If only ordinary conversation happened, set recent_event_updates to [] and explain rejected candidates if useful.
@@ -620,6 +622,162 @@ function extractJsonValueForKey(text, key) {
     return null;
 }
 
+function objectCoalescingEnabled() {
+    return (settings().objectCoalescingMode || 'conservative') !== 'off';
+}
+
+function objectLocationGroupKey(obj, fallbackScene = '') {
+    const location = sanitizeText(obj?.location);
+    const sceneRef = sanitizeText(obj?.scene_ref || fallbackScene);
+    return `${sceneRef.toLowerCase()}||${location.toLowerCase()}`;
+}
+
+function parseCashAmount(text) {
+    const t = sanitizeText(text);
+    if (!t) return null;
+    if (/cash register|cash box|cashier/i.test(t)) return null;
+    let m = /(?:AUD\s*)?\$\s*(\d+(?:\.\d{1,2})?)/i.exec(t);
+    if (m) return Number(m[1]);
+    m = /\b(\d+(?:\.\d{1,2})?)\s*(?:dollars?|bucks?)\b/i.exec(t);
+    if (m) return Number(m[1]);
+    return null;
+}
+
+function isCashObject(obj) {
+    const name = sanitizeText(obj?.name);
+    return parseCashAmount(name) !== null && /\$|cash|money|dollars?|bucks?/i.test(name);
+}
+
+function componentKey(component) {
+    return `${sanitizeText(component?.name).toLowerCase()}||${Number(component?.amount || 0)}`;
+}
+
+function cashComponentsFromObject(obj) {
+    const existing = Array.isArray(obj?.components) ? obj.components : [];
+    const out = [];
+    for (const c of existing) {
+        const amount = Number(c?.amount ?? parseCashAmount(c?.name));
+        const name = sanitizeText(c?.name || obj?.name);
+        if (name && Number.isFinite(amount) && amount > 0) out.push({ name, amount });
+    }
+    if (out.length) return out;
+    const amount = parseCashAmount(obj?.name);
+    const name = sanitizeText(obj?.name);
+    if (name && Number.isFinite(amount) && amount > 0) return [{ name, amount }];
+    return [];
+}
+
+function formatMoneyAmount(amount) {
+    const n = Number(amount || 0);
+    return Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/0+$/,'').replace(/\.$/,'');
+}
+
+function normalizeGenericObjectName(name) {
+    let t = sanitizeText(name).toLowerCase();
+    if (!t) return '';
+    if (/\b(sage|davo|josy|quinn|maya|bella|jill|mc|user)'s\b/i.test(t)) return '';
+    if (/\b(phone|key|keycard|letter|note|weapon|gun|knife|evidence|gift|bag|jacket|shirt|pants|dress|bra|underwear|contract|document|id card|wallet|purse)\b/i.test(t)) return '';
+    if (!/\b(bottle|can|cup|glass|plate|paper|flyer|ticket|napkin|coin|beer|shot)\b/i.test(t)) return '';
+    t = t.replace(/\s+from\s+.+$/i, '');
+    t = t.replace(/\s*\([^)]*\)\s*$/g, '');
+    t = t.replace(/\s+/g, ' ').trim();
+    t = t.replace(/s$/i, '');
+    return t;
+}
+
+function pluralizeGenericName(base, count) {
+    if (count === 1) return base;
+    if (/y$/i.test(base)) return base.replace(/y$/i, 'ies');
+    if (/(s|x|ch|sh)$/i.test(base)) return `${base}es`;
+    return `${base}s`;
+}
+
+function coalesceNearbyObjects(objects, fallbackScene = '', turn = 0) {
+    if (!objectCoalescingEnabled()) return Array.isArray(objects) ? objects : [];
+    const input = (Array.isArray(objects) ? objects : []).filter(o => o && (o.name || o.location));
+    if (!input.length) return [];
+
+    const used = new Set();
+    const result = [];
+
+    const cashGroups = new Map();
+    input.forEach((obj, idx) => {
+        if (!isCashObject(obj)) return;
+        const key = objectLocationGroupKey(obj, fallbackScene);
+        if (!cashGroups.has(key)) cashGroups.set(key, []);
+        cashGroups.get(key).push({ obj, idx });
+    });
+
+    for (const group of cashGroups.values()) {
+        const components = [];
+        const seenComponents = new Set();
+        for (const { obj, idx } of group) {
+            for (const comp of cashComponentsFromObject(obj)) {
+                const key = componentKey(comp);
+                if (!key || seenComponents.has(key)) continue;
+                seenComponents.add(key);
+                components.push(comp);
+            }
+            used.add(idx);
+        }
+        const total = components.reduce((sum, c) => sum + Number(c.amount || 0), 0);
+        if (total > 0) {
+            const first = group[0].obj;
+            result.push({
+                name: `$${formatMoneyAmount(total)} cash`,
+                location: sanitizeText(first.location),
+                scene_ref: sanitizeText(first.scene_ref || fallbackScene),
+                evidence: `Coalesced cash from: ${components.map(c => c.name).join('; ')}`,
+                last_updated_turn: turn || first.last_updated_turn || 0,
+                coalesced_category: 'cash',
+                quantity: total,
+                unit: '$',
+                components
+            });
+        }
+    }
+
+    const genericGroups = new Map();
+    input.forEach((obj, idx) => {
+        if (used.has(idx)) return;
+        const base = normalizeGenericObjectName(obj.name);
+        if (!base) return;
+        const key = `${objectLocationGroupKey(obj, fallbackScene)}||${base}`;
+        if (!genericGroups.has(key)) genericGroups.set(key, { base, entries: [] });
+        genericGroups.get(key).entries.push({ obj, idx });
+    });
+
+    for (const group of genericGroups.values()) {
+        if (group.entries.length < 2) continue;
+        const first = group.entries[0].obj;
+        for (const { idx } of group.entries) used.add(idx);
+        result.push({
+            name: `${group.entries.length} ${pluralizeGenericName(group.base, group.entries.length)}`,
+            location: sanitizeText(first.location),
+            scene_ref: sanitizeText(first.scene_ref || fallbackScene),
+            evidence: `Coalesced from: ${group.entries.map(e => sanitizeText(e.obj.name)).join('; ')}`,
+            last_updated_turn: turn || first.last_updated_turn || 0,
+            coalesced_category: 'generic',
+            quantity: group.entries.length,
+            components: group.entries.map(e => ({ name: sanitizeText(e.obj.name), amount: 1 }))
+        });
+    }
+
+    input.forEach((obj, idx) => {
+        if (!used.has(idx)) result.push(obj);
+    });
+    return result;
+}
+
+function coalesceSceneUpdateObjects(delta) {
+    if (!objectCoalescingEnabled()) return delta;
+    const su = delta?.scene_update;
+    if (!su || !Array.isArray(su.nearby_objects_add_or_update)) return delta;
+    const sceneRef = sanitizeText(su.location_ref || metadata().currentScene?.location_ref);
+    su.nearby_objects_add_or_update = coalesceNearbyObjects(su.nearby_objects_add_or_update, sceneRef, 0);
+    return delta;
+}
+
 function normalizeProposal(raw) {
     const normalized = {
         scene_update: {
@@ -704,6 +862,7 @@ function normalizeProposal(raw) {
 
     normalizeSplitRemoteSceneDelta(normalized);
     filterSurroundingsDelta(normalized);
+    coalesceSceneUpdateObjects(normalized);
     return filterNoOpSceneDelta(normalized);
 }
 
@@ -1167,6 +1326,8 @@ function applyProposalObject(proposal) {
         }
     }
 
+    scene.nearby_objects = coalesceNearbyObjects(scene.nearby_objects, scene.location_ref || oldLocation, turn);
+
     if (!staleSceneProposal && hasSubstantiveDelta(effectiveDelta)) scene.last_updated_turn = turn;
     m.currentScene = scene;
 
@@ -1535,6 +1696,18 @@ function clearNearbyObjects() {
     toastInfo(`Cleared ${count} nearby object(s).`);
 }
 
+async function coalesceCurrentObjects() {
+    const m = metadata();
+    const scene = m.currentScene || structuredCloneSafe(EMPTY_SCENE);
+    const before = Array.isArray(scene.nearby_objects) ? scene.nearby_objects.length : 0;
+    scene.nearby_objects = coalesceNearbyObjects(scene.nearby_objects || [], scene.location_ref || '', scene.last_updated_turn || 0);
+    const after = scene.nearby_objects.length;
+    m.currentScene = scene;
+    await saveMetadataNow();
+    updatePanel();
+    toastInfo(`Coalesced nearby objects: ${before} → ${after}.`);
+}
+
 function resetState() {
     if (!confirm('Reset Sage factoid extractor state for this chat?')) return;
     const context = ctx();
@@ -1577,6 +1750,7 @@ function updatePanel() {
     setInputValue('sfe_max_events_per_proposal', s.maxEventsPerProposal);
     setInputValue('sfe_clear_objects_on_location_change', s.clearRoomObjectsOnLocationChange, 'checked');
     setInputValue('sfe_surroundings_mode', s.surroundingsUpdateMode || 'location_only');
+    setInputValue('sfe_object_coalescing_mode', s.objectCoalescingMode || 'conservative');
 
     const latest = reviewProposal();
     const summaryPre = document.querySelector('#sfe_latest_summary');
@@ -1644,6 +1818,7 @@ function installUi() {
   <div class="sfe-row"><label><input id="sfe_strict_events" type="checkbox"> Strict RecentEvents gate</label><label for="sfe_min_event_importance">Min event importance</label><input id="sfe_min_event_importance" type="number" min="0" max="5" step="1"><label for="sfe_max_events_per_proposal">Max events/proposal</label><input id="sfe_max_events_per_proposal" type="number" min="0" max="3" step="1"></div>
   <div class="sfe-row"><label><input id="sfe_clear_objects_on_location_change" type="checkbox"> Expire old room objects on location change</label><span class="sfe-small">Recommended on: prevents “The floor” objects from following Sage into a new room.</span></div>
   <div class="sfe-row"><label for="sfe_surroundings_mode">Surroundings update mode</label><select id="sfe_surroundings_mode"><option value="location_only">Location/sub-location/environment only</option><option value="normal">Normal extractor output</option></select><span class="sfe-small">Default suppresses body-position, touch, intensity, mood, and decorative surroundings churn.</span></div>
+  <div class="sfe-row"><label for="sfe_object_coalescing_mode">Object coalescing mode</label><select id="sfe_object_coalescing_mode"><option value="conservative">Conservative: cash + identical generic objects</option><option value="off">Off</option></select><span class="sfe-small">Combines interchangeable same-location objects, e.g. multiple $10 payments into one cash total.</span></div>
 
   <div class="sfe-row sfe-buttons">
     <button id="sfe_run_now" class="menu_button">Run extraction now</button>
@@ -1654,6 +1829,7 @@ function installUi() {
     <button id="sfe_copy_packets" class="menu_button">Copy OOC packet preview</button>
     <button id="sfe_prune_events" class="menu_button">Prune weak RecentEvents</button>
     <button id="sfe_clear_objects" class="menu_button">Clear nearby objects</button>
+    <button id="sfe_coalesce_objects" class="menu_button">Coalesce current objects</button>
     <button id="sfe_export_json" class="menu_button">Export audit JSON</button>
     <button id="sfe_export_md" class="menu_button">Export controller MD</button>
     <button id="sfe_reset" class="menu_button">Reset chat state</button>
@@ -1694,6 +1870,7 @@ function installUi() {
     bindSetting('sfe_max_events_per_proposal', 'maxEventsPerProposal', 'number');
     bindSetting('sfe_clear_objects_on_location_change', 'clearRoomObjectsOnLocationChange', 'boolean');
     bindSetting('sfe_surroundings_mode', 'surroundingsUpdateMode');
+    bindSetting('sfe_object_coalescing_mode', 'objectCoalescingMode');
 
     document.getElementById('sfe_run_now')?.addEventListener('click', () => runExtraction('manual'));
     document.getElementById('sfe_apply_latest')?.addEventListener('click', async () => {
@@ -1716,6 +1893,8 @@ function installUi() {
     document.getElementById('sfe_copy_latest')?.addEventListener('click', () => copyToClipboard(JSON.stringify(latestProposal() || {}, null, 2)));
     document.getElementById('sfe_copy_packets')?.addEventListener('click', () => copyToClipboard(renderPackets()));
     document.getElementById('sfe_prune_events')?.addEventListener('click', () => pruneStoredRecentEvents());
+    document.getElementById('sfe_clear_objects')?.addEventListener('click', () => clearNearbyObjects());
+    document.getElementById('sfe_coalesce_objects')?.addEventListener('click', () => coalesceCurrentObjects());
     document.getElementById('sfe_export_json')?.addEventListener('click', exportAuditJson);
     document.getElementById('sfe_export_md')?.addEventListener('click', exportControllerMarkdown);
     document.getElementById('sfe_reset')?.addEventListener('click', resetState);

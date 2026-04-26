@@ -1,3 +1,13 @@
+# Sage Phase 1 Factoid Extractor v0.1.20
+
+## v0.1.20 changes
+
+- Adds conservative object coalescing.
+- Combines interchangeable same-location cash items into one total, e.g. `$40 cash`.
+- Can merge identical generic same-location items, such as duplicate bottles/cups/glasses/papers, while avoiding unique/personal/named items.
+- Adds an **Object coalescing mode** setting and **Coalesce current objects** button.
+- Retains all v0.1.19 JSON repair and split-scene handling.
+
 # Sage Phase 1 Factoid Extractor v0.1.19
 
 ## v0.1.19 changes
