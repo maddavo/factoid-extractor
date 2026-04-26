@@ -1,7 +1,7 @@
 // Sage Phase 1 Factoid Extractor for SillyTavern
-// v0.1.13 — ordered pending queue and stale scene-update guard.
+// v0.1.14 — no-op proposal filtering and contradictory object-delta cleanup.
 
-const EXTENSION_VERSION = '0.1.13';
+const EXTENSION_VERSION = '0.1.14';
 
 const MODULE_NAME = 'sage_phase1_factoid_extractor';
 const MODULE_TITLE = 'Sage Phase 1 Factoid Extractor';
@@ -70,6 +70,8 @@ STRICT RULES:
 - Do not store generic flirt lines, banter, emotional colour, ordinary replies, questions, acknowledgements, or decorative ambience as RecentEvents.
 - Do not turn every response into a RecentEvent. RecentEvents should be rare.
 - Do not duplicate CurrentScene in RecentEvents. If the scene/object state already captures the change, leave recent_event_updates empty unless there is a still-unresolved practical consequence.
+- Do not output no-op scene updates. If an object is already recorded at the same location, do not add/update it again.
+- Do not output both add/update and remove for the same object in one proposal. If the object is still present, do not remove it.
 - A RecentEvent must pass this gate: would omitting it likely cause Sage to contradict an unresolved task, obligation, broken/lost item, urgent interruption, or changed plan within the next 5-10 turns? If no, do not extract it.
 - For RecentEvents, importance_score uses 0-5. Output only importance_score 4 or 5 events.
 - Output at most one new RecentEvent per extraction pass. If several candidates exist, keep only the most practically urgent one.
@@ -650,7 +652,108 @@ function normalizeProposal(raw) {
     if (normalized.scene_update.location_ref !== null) normalized.scene_update.location_ref = sanitizeText(normalized.scene_update.location_ref);
     if (normalized.scene_update.surroundings_summary !== null) normalized.scene_update.surroundings_summary = sanitizeText(normalized.scene_update.surroundings_summary);
 
-    return normalized;
+    return filterNoOpSceneDelta(normalized);
+}
+
+
+function filterNoOpSceneDelta(delta) {
+    const m = metadata();
+    const current = m.currentScene || EMPTY_SCENE;
+    const su = delta.scene_update || {};
+    const rejected = [];
+
+    if (su.location_ref !== null && sameText(su.location_ref, current.location_ref)) {
+        rejected.push({ candidate: `Current location: ${su.location_ref}`, reason: 'No-op scene update: current location is already stored.' });
+        su.location_ref = null;
+    }
+
+    if (su.surroundings_summary !== null && sameText(su.surroundings_summary, current.surroundings_summary)) {
+        rejected.push({ candidate: `Surroundings: ${su.surroundings_summary}`, reason: 'No-op scene update: surroundings summary is already stored.' });
+        su.surroundings_summary = null;
+    }
+
+    const present = Array.isArray(current.present_entities) ? current.present_entities : [];
+    su.present_entities_add = (su.present_entities_add || []).filter(ent => {
+        if (present.some(existing => sameText(existing, ent))) {
+            rejected.push({ candidate: `Present entity: ${ent}`, reason: 'No-op entity update: entity is already present.' });
+            return false;
+        }
+        return true;
+    });
+    su.present_entities_remove = (su.present_entities_remove || []).filter(ent => {
+        if (!present.some(existing => sameText(existing, ent))) {
+            rejected.push({ candidate: `Remove present entity: ${ent}`, reason: 'No-op entity removal: entity is not currently present.' });
+            return false;
+        }
+        return true;
+    });
+
+    const proposedUpdatesByName = new Map();
+    const keptUpdates = [];
+
+    for (const obj of su.nearby_objects_add_or_update || []) {
+        const name = sanitizeText(obj?.name);
+        const location = sanitizeText(obj?.location);
+        if (!name || !location) continue;
+        const existing = findCurrentObjectByName(name);
+        if (existing && objectLocationSame(existing, obj)) {
+            const loc = displayLocationForObject(existing.location, existing.scene_ref || current.location_ref);
+            rejected.push({ candidate: `${loc}: ${name}`, reason: 'No-op object update: object is already stored at that location.' });
+            proposedUpdatesByName.set(canonicalKey(name), { obj, noOp: true });
+            continue;
+        }
+        keptUpdates.push(obj);
+        proposedUpdatesByName.set(canonicalKey(name), { obj, noOp: false });
+    }
+    su.nearby_objects_add_or_update = keptUpdates;
+
+    const seenRemoves = new Set();
+    const keptRemoves = [];
+    for (const rawRemove of su.nearby_objects_remove || []) {
+        const name = objectRemoveName(rawRemove);
+        const key = canonicalKey(name);
+        if (!key || seenRemoves.has(key)) continue;
+        seenRemoves.add(key);
+
+        const currentObj = findCurrentObjectByName(name);
+        const proposed = proposedUpdatesByName.get(key);
+        if (proposed) {
+            const loc = currentObj
+                ? displayLocationForObject(currentObj.location, currentObj.scene_ref || current.location_ref)
+                : displayLocationForObject(proposed.obj?.location, current.location_ref);
+            rejected.push({ candidate: `Remove ${loc ? loc + ': ' : ''}${name}`, reason: 'Conflicting object removal dropped: same proposal also states the object is present/updated.' });
+            continue;
+        }
+        if (!currentObj) {
+            rejected.push({ candidate: `Remove object: ${name}`, reason: 'No-op object removal: object is not currently stored.' });
+            continue;
+        }
+        keptRemoves.push(name);
+    }
+    su.nearby_objects_remove = keptRemoves;
+
+    if (rejected.length) {
+        delta.rejected_candidates = [ ...(delta.rejected_candidates || []), ...rejected ];
+        if (!hasSubstantiveDelta(delta) && !delta.no_update_reason) {
+            delta.no_update_reason = 'Extractor proposed only no-op or contradictory scene changes already covered by the applied state.';
+        }
+    }
+    return delta;
+}
+
+function findCurrentObjectByName(name) {
+    const currentObjects = metadata().currentScene?.nearby_objects || [];
+    return currentObjects.find(o => sameText(o?.name, name)) || null;
+}
+
+function objectLocationSame(existing, proposed) {
+    if (!existing || !proposed) return false;
+    const currentScene = metadata().currentScene?.location_ref || '';
+    const existingDisplay = displayLocationForObject(existing.location, existing.scene_ref || currentScene);
+    const proposedDisplay = displayLocationForObject(proposed.location, proposed.scene_ref || currentScene);
+    if (sameText(existingDisplay, proposedDisplay)) return true;
+    if (sameText(existing.location, proposed.location)) return true;
+    return false;
 }
 
 function eventGateReason(event, minImportance, sceneUpdate = null) {

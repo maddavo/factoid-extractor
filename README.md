@@ -1,4 +1,4 @@
-# Sage Phase 1 Factoid Extractor v0.1.13
+# Sage Phase 1 Factoid Extractor v0.1.14
 
 A review-first SillyTavern UI extension for the Sage continuity project.
 
@@ -8,6 +8,11 @@ It watches live chat events, calls a local OpenAI-compatible extractor endpoint,
 - `RecentEvents`
 
 It does **not** redesign the Sage card or preset. It does **not** build Data Bank or persistent long-term memory. It is intended to test whether factoids can be extracted from live chat with low enough operator burden to continue the project.
+
+## v0.1.14 fix
+
+- Filters no-op scene proposals before review. If an object/entity/location/surroundings value is already applied, it no longer appears as an ADD/UPDATE line.
+- Drops contradictory same-object add/remove proposals in one extractor result. Explicit presence/update is treated as evidence not to remove it, but if the update is also a no-op then both lines disappear from the operator review.
 
 ## Default behaviour
 
@@ -62,7 +67,7 @@ In LM Studio, start the local server and load the model you want to test as the 
 
 This build defaults to the SillyTavern CORS proxy path. In `config.yaml`, set `enableCorsProxy: true`, then restart SillyTavern.
 
-## v0.1.13 pending queue fix
+## v0.1.14 pending queue fix
 
 - The review panel now shows the **next pending proposal** rather than an arbitrary latest entry.
 - Pending proposals are applied/rejected oldest-first by turn count.
@@ -167,7 +172,7 @@ Auto-run policy: Periodic or explicit marker only
 ```
 
 
-## v0.1.13 throttle UI
+## v0.1.14 throttle UI
 
 This build exposes the throttle controls in the panel:
 
@@ -186,6 +191,6 @@ Scene cue prefilter: on
 ```
 
 
-## v0.1.13 note
+## v0.1.14 note
 
 When the applied location changes, old room-local nearby objects are expired unless the extractor explicitly re-adds them in the new scene. This prevents generic anchors such as "The floor" from following the chat into a new room. A manual "Clear nearby objects" button is also available for cleaning already-contaminated state.
