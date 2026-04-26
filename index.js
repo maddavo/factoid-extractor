@@ -1,7 +1,7 @@
 // Sage Phase 1 Factoid Extractor for SillyTavern
-// v0.1.12 — scene-change stale object expiry.
+// v0.1.13 — ordered pending queue and stale scene-update guard.
 
-const EXTENSION_VERSION = '0.1.12';
+const EXTENSION_VERSION = '0.1.13';
 
 const MODULE_NAME = 'sage_phase1_factoid_extractor';
 const MODULE_TITLE = 'Sage Phase 1 Factoid Extractor';
@@ -848,11 +848,33 @@ function applyProposalObject(proposal) {
     const oldLocation = scene.location_ref || '';
     const newLocation = su.location_ref || '';
     const locationChanged = Boolean(newLocation && oldLocation && !sameText(oldLocation, newLocation));
+    const staleSceneProposal = Number(scene.last_updated_turn || 0) > 0 && Number(turn || 0) < Number(scene.last_updated_turn || 0);
 
     scene.nearby_objects = Array.isArray(scene.nearby_objects) ? scene.nearby_objects : [];
-    if (settings().clearRoomObjectsOnLocationChange && locationChanged) {
-        const staleBefore = staleObjectsForSceneChange(su);
-        const keepNames = new Set((su.nearby_objects_add_or_update || [])
+    if (staleSceneProposal) {
+        proposal.stale_scene_update_skipped = `Proposal turn ${turn} is older than applied scene turn ${scene.last_updated_turn}; scene/location/surroundings/object changes were not applied.`;
+        const copied = structuredCloneSafe(delta);
+        copied.scene_update = {
+            location_ref: null,
+            present_entities_add: [],
+            present_entities_remove: [],
+            nearby_objects_add_or_update: [],
+            nearby_objects_remove: [],
+            surroundings_summary: null
+        };
+        copied.rejected_candidates = [
+            ...(copied.rejected_candidates || []),
+            { candidate: 'Stale scene update', reason: proposal.stale_scene_update_skipped }
+        ];
+        proposal.delta = copied;
+    }
+
+    const effectiveDelta = proposal.delta || delta;
+    const effectiveSceneUpdate = effectiveDelta.scene_update || {};
+
+    if (!staleSceneProposal && settings().clearRoomObjectsOnLocationChange && locationChanged) {
+        const staleBefore = staleObjectsForSceneChange(effectiveSceneUpdate);
+        const keepNames = new Set((effectiveSceneUpdate.nearby_objects_add_or_update || [])
             .map(o => canonicalKey(o?.name))
             .filter(Boolean));
         scene.nearby_objects = scene.nearby_objects.filter(o => keepNames.has(canonicalKey(o?.name)));
@@ -864,16 +886,16 @@ function applyProposalObject(proposal) {
         }));
     }
 
-    if (su.location_ref) scene.location_ref = su.location_ref;
-    if (su.surroundings_summary) scene.surroundings_summary = su.surroundings_summary;
+    if (effectiveSceneUpdate.location_ref) scene.location_ref = effectiveSceneUpdate.location_ref;
+    if (effectiveSceneUpdate.surroundings_summary) scene.surroundings_summary = effectiveSceneUpdate.surroundings_summary;
 
-    for (const ent of su.present_entities_add || []) addUnique(scene.present_entities, ent);
-    for (const ent of su.present_entities_remove || []) removeByCaseInsensitive(scene.present_entities, ent);
+    for (const ent of effectiveSceneUpdate.present_entities_add || []) addUnique(scene.present_entities, ent);
+    for (const ent of effectiveSceneUpdate.present_entities_remove || []) removeByCaseInsensitive(scene.present_entities, ent);
 
-    for (const removeName of su.nearby_objects_remove || []) {
+    for (const removeName of effectiveSceneUpdate.nearby_objects_remove || []) {
         scene.nearby_objects = scene.nearby_objects.filter(o => !sameText(o.name, removeName));
     }
-    for (const obj of su.nearby_objects_add_or_update || []) {
+    for (const obj of effectiveSceneUpdate.nearby_objects_add_or_update || []) {
         if (!obj.name || !obj.location) continue;
         const existing = scene.nearby_objects.find(o => sameText(o.name, obj.name));
         if (existing) {
@@ -892,10 +914,10 @@ function applyProposalObject(proposal) {
         }
     }
 
-    if (hasSubstantiveDelta(delta)) scene.last_updated_turn = turn;
+    if (!staleSceneProposal && hasSubstantiveDelta(effectiveDelta)) scene.last_updated_turn = turn;
     m.currentScene = scene;
 
-    for (const event of delta.recent_event_updates || []) {
+    for (const event of effectiveDelta.recent_event_updates || []) {
         if (!event.summary) continue;
         const duplicate = m.recentEvents.find(e => sameText(e.summary, event.summary));
         if (duplicate) {
@@ -917,7 +939,7 @@ function applyProposalObject(proposal) {
         }
     }
 
-    for (const res of delta.resolved_event_updates || []) {
+    for (const res of effectiveDelta.resolved_event_updates || []) {
         const matchText = res.matches_existing_event || '';
         const matched = m.recentEvents.find(e => sameText(e.summary, matchText) || e.summary.toLowerCase().includes(matchText.toLowerCase()) || matchText.toLowerCase().includes(e.summary.toLowerCase()));
         if (matched) {
@@ -1069,8 +1091,10 @@ function renderProposalSummary(proposal) {
     const substantive = hasSubstantiveDelta(delta);
 
     lines.push(`Status: ${proposal.status || 'unknown'}`);
+    lines.push(`Review order: ${proposal.status === 'pending' ? 'next pending proposal (oldest first)' : 'not pending / audit view'}`);
     lines.push(`Reason: ${proposal.reason || 'unknown'}`);
     lines.push(`Turn count: ${proposal.turn_count ?? 'unknown'}`);
+    if (proposal.stale_scene_update_skipped) lines.push(`Stale scene update skipped: ${proposal.stale_scene_update_skipped}`);
     lines.push('');
 
     if (!substantive) {
@@ -1163,8 +1187,40 @@ function renderProposalSummary(proposal) {
     return lines.join('\n');
 }
 
+function pendingProposalsOrdered() {
+    const pending = (metadata().pendingProposals || []).filter(p => p.status === 'pending');
+    return pending.slice().sort((a, b) => {
+        const ta = Number(a.turn_count || 0);
+        const tb = Number(b.turn_count || 0);
+        if (ta !== tb) return ta - tb;
+        return String(a.created_at || '').localeCompare(String(b.created_at || ''));
+    });
+}
+
+function reviewProposal() {
+    return pendingProposalsOrdered()[0] || (metadata().pendingProposals || [])[0] || null;
+}
+
 function latestProposal() {
-    return metadata().pendingProposals?.[0] || null;
+    return reviewProposal();
+}
+
+function renderPendingQueue() {
+    const pending = pendingProposalsOrdered();
+    if (!pending.length) return 'No pending proposals.';
+    const lines = ['Pending proposal queue (oldest first):'];
+    pending.forEach((p, i) => {
+        const delta = p.delta || {};
+        const su = delta.scene_update || {};
+        const parts = [];
+        if (su.location_ref) parts.push(`location=${su.location_ref}`);
+        if (su.surroundings_summary) parts.push('surroundings');
+        if (su.present_entities_add?.length || su.present_entities_remove?.length) parts.push('entities');
+        if (su.nearby_objects_add_or_update?.length || su.nearby_objects_remove?.length) parts.push('objects');
+        if (delta.recent_event_updates?.length || delta.resolved_event_updates?.length) parts.push('events');
+        lines.push(`${i + 1}. Turn ${p.turn_count ?? '?'} | ${p.created_at || ''} | ${parts.join(', ') || 'no substantive fields'} | id ${p.id}`);
+    });
+    return lines.join('\n');
 }
 
 function copyToClipboard(text) {
@@ -1266,12 +1322,16 @@ function updatePanel() {
     setInputValue('sfe_max_events_per_proposal', s.maxEventsPerProposal);
     setInputValue('sfe_clear_objects_on_location_change', s.clearRoomObjectsOnLocationChange, 'checked');
 
-    const latest = latestProposal();
+    const latest = reviewProposal();
     const summaryPre = document.querySelector('#sfe_latest_summary');
     if (summaryPre) summaryPre.textContent = renderProposalSummary(latest);
 
     const proposalPre = document.querySelector('#sfe_latest_proposal');
-    if (proposalPre) proposalPre.textContent = latest ? JSON.stringify(latest, null, 2) : (m.lastRawExtractorText ? `Last raw extractor text from failed parse:\n${m.lastRawExtractorText}` : 'No extractor output yet.');
+    if (proposalPre) proposalPre.textContent = latest ? JSON.stringify(latest, null, 2) : (m.lastRawExtractorText ? `Last raw extractor text from failed parse:
+${m.lastRawExtractorText}` : 'No extractor output yet.');
+
+    const queuePre = document.querySelector('#sfe_pending_queue');
+    if (queuePre) queuePre.textContent = renderPendingQueue();
 
     const statePre = document.querySelector('#sfe_state_preview');
     if (statePre) statePre.textContent = JSON.stringify({ currentScene: m.currentScene, recentEvents: m.recentEvents }, null, 2);
@@ -1282,7 +1342,9 @@ function updatePanel() {
     const countEl = document.querySelector('#sfe_counts');
     if (countEl) {
         const pending = m.pendingProposals.filter(p => p.status === 'pending').length;
-        countEl.textContent = `Version: v${EXTENSION_VERSION} | Audit runs: ${m.auditLog.length} | pending: ${pending} | skipped: ${m.skippedRuns || 0} | last run: ${m.lastRunAt || 'never'} | last skip: ${m.lastSkipReason || 'none'}`;
+        const next = pendingProposalsOrdered()[0];
+        const nextText = next ? ` | next pending turn: ${next.turn_count ?? '?'}` : '';
+        countEl.textContent = `Version: v${EXTENSION_VERSION} | Audit runs: ${m.auditLog.length} | pending: ${pending}${nextText} | skipped: ${m.skippedRuns || 0} | last run: ${m.lastRunAt || 'never'} | last skip: ${m.lastSkipReason || 'none'}`;
     }
 
     if (m.lastError) updateUiStatus('bad', `Last error: ${m.lastError}`);
@@ -1328,8 +1390,8 @@ function installUi() {
 
   <div class="sfe-row sfe-buttons">
     <button id="sfe_run_now" class="menu_button">Run extraction now</button>
-    <button id="sfe_apply_latest" class="menu_button">Apply latest pending</button>
-    <button id="sfe_reject_latest" class="menu_button">Reject latest pending</button>
+    <button id="sfe_apply_latest" class="menu_button">Apply next pending</button>
+    <button id="sfe_reject_latest" class="menu_button">Reject next pending</button>
     <button id="sfe_copy_summary" class="menu_button">Copy review summary</button>
     <button id="sfe_copy_latest" class="menu_button">Copy latest JSON</button>
     <button id="sfe_copy_packets" class="menu_button">Copy OOC packet preview</button>
@@ -1343,8 +1405,9 @@ function installUi() {
   <div id="sfe_status" class="sfe-status-warn">Idle.</div>
   <div id="sfe_counts" class="sfe-small"></div>
 
-  <details open><summary>Latest proposed packet changes</summary><pre id="sfe_latest_summary"></pre></details>
-  <details><summary>Raw latest extractor JSON</summary><pre id="sfe_latest_proposal"></pre></details>
+  <details open><summary>Next pending proposed packet changes</summary><pre id="sfe_latest_summary"></pre></details>
+  <details open><summary>Pending proposal queue</summary><pre id="sfe_pending_queue"></pre></details>
+  <details><summary>Raw selected/next extractor JSON</summary><pre id="sfe_latest_proposal"></pre></details>
   <details><summary>Applied Phase 1 state</summary><pre id="sfe_state_preview"></pre></details>
   <details><summary>Rendered OOC packet preview</summary><pre id="sfe_packet_preview"></pre></details>
 </div>`;
@@ -1374,20 +1437,20 @@ function installUi() {
 
     document.getElementById('sfe_run_now')?.addEventListener('click', () => runExtraction('manual'));
     document.getElementById('sfe_apply_latest')?.addEventListener('click', async () => {
-        const p = metadata().pendingProposals.find(x => x.status === 'pending');
+        const p = pendingProposalsOrdered()[0];
         if (!p) return toastWarn('No pending substantive proposal.');
         applyProposalById(p.id);
         await saveMetadataNow();
         updatePanel();
-        toastInfo('Latest pending proposal applied.');
+        toastInfo('Next pending proposal applied.');
     });
     document.getElementById('sfe_reject_latest')?.addEventListener('click', async () => {
-        const p = metadata().pendingProposals.find(x => x.status === 'pending');
+        const p = pendingProposalsOrdered()[0];
         if (!p) return toastWarn('No pending substantive proposal.');
         rejectProposalById(p.id);
         await saveMetadataNow();
         updatePanel();
-        toastInfo('Latest pending proposal rejected.');
+        toastInfo('Next pending proposal rejected.');
     });
     document.getElementById('sfe_copy_summary')?.addEventListener('click', () => copyToClipboard(renderProposalSummary(latestProposal())));
     document.getElementById('sfe_copy_latest')?.addEventListener('click', () => copyToClipboard(JSON.stringify(latestProposal() || {}, null, 2)));

@@ -1,4 +1,4 @@
-# Sage Phase 1 Factoid Extractor v0.1.12
+# Sage Phase 1 Factoid Extractor v0.1.13
 
 A review-first SillyTavern UI extension for the Sage continuity project.
 
@@ -61,6 +61,13 @@ Expire old room objects on location change: on
 In LM Studio, start the local server and load the model you want to test as the extractor.
 
 This build defaults to the SillyTavern CORS proxy path. In `config.yaml`, set `enableCorsProxy: true`, then restart SillyTavern.
+
+## v0.1.13 pending queue fix
+
+- The review panel now shows the **next pending proposal** rather than an arbitrary latest entry.
+- Pending proposals are applied/rejected oldest-first by turn count.
+- A visible Pending Proposal Queue shows all waiting proposals.
+- Stale scene updates are guarded: an older pending proposal cannot overwrite a newer applied `location_ref`, `surroundings_summary`, or object state.
 
 ## Viability test workflow
 
@@ -160,7 +167,7 @@ Auto-run policy: Periodic or explicit marker only
 ```
 
 
-## v0.1.12 throttle UI
+## v0.1.13 throttle UI
 
 This build exposes the throttle controls in the panel:
 
@@ -179,6 +186,6 @@ Scene cue prefilter: on
 ```
 
 
-## v0.1.12 note
+## v0.1.13 note
 
 When the applied location changes, old room-local nearby objects are expired unless the extractor explicitly re-adds them in the new scene. This prevents generic anchors such as "The floor" from following the chat into a new room. A manual "Clear nearby objects" button is also available for cleaning already-contaminated state.
