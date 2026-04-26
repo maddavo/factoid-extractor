@@ -1,5 +1,5 @@
 // Sage Phase 1 Factoid Extractor for SillyTavern
-// v0.1.4 — review-first, Phase 1 only: CurrentScene + RecentEvents. Grouped object-location packet rendering.
+// v0.1.5 — stricter RecentEvents gate; scene/object extraction unchanged.
 
 const MODULE_NAME = 'sage_phase1_factoid_extractor';
 const MODULE_TITLE = 'Sage Phase 1 Factoid Extractor';
@@ -19,6 +19,9 @@ const DEFAULT_SETTINGS = Object.freeze({
     autoApply: false,
     keepResolvedEvents: false,
     unresolvedEventLimit: 6,
+    strictRecentEvents: true,
+    minEventImportance: 4,
+    maxEventsPerProposal: 1,
     debug: false
 });
 
@@ -43,8 +46,10 @@ PHASE 1 STATE ONLY:
 - one short surroundings summary only if it materially anchors the scene
 
 2. RecentEvents:
-- only recent events that changed practical state
-- examples: object moved, object broken, object hidden, item handed over, item lost/found, promise made, task/deadline introduced, urgent interruption, person entered/left if it affects the scene, factual reminder became relevant
+- only rare, temporary, unresolved practical reminders that Sage must remember in the next several turns
+- use RecentEvents only when there is a clear consequence not already captured by CurrentScene
+- examples that usually qualify: object broken and still matters, important item lost and not found, explicit promise/request/task/deadline, urgent interruption, a plan changed with unresolved next action, factual reminder that must affect the next response
+- examples that usually do NOT qualify: ordinary dialogue progress, greetings, banter, flirtation, emotional colour, a normal question/answer, a minor observation, scene transition already stored in CurrentScene, object placement/movement already stored in CurrentScene, person entered/left already reflected in present_entities, completed handover with no unresolved consequence
 
 STRICT RULES:
 - Prefer no update over guessing.
@@ -55,11 +60,17 @@ STRICT RULES:
 - For nearby_objects_remove, output only the object name as a string, never an object.
 - Avoid pronouns in stored facts.
 - Do not store mood as a scene fact.
-- Do not store generic flirt lines, banter, emotional colour, or decorative ambience unless it changes practical state.
+- Do not store generic flirt lines, banter, emotional colour, ordinary replies, questions, acknowledgements, or decorative ambience as RecentEvents.
+- Do not turn every response into a RecentEvent. RecentEvents should be rare.
+- Do not duplicate CurrentScene in RecentEvents. If the scene/object state already captures the change, leave recent_event_updates empty unless there is a still-unresolved practical consequence.
+- A RecentEvent must pass this gate: would omitting it likely cause Sage to contradict an unresolved task, obligation, broken/lost item, urgent interruption, or changed plan within the next 5-10 turns? If no, do not extract it.
+- For RecentEvents, importance_score uses 0-5. Output only importance_score 4 or 5 events.
+- Output at most one new RecentEvent per extraction pass. If several candidates exist, keep only the most practically urgent one.
 - Do not treat decorative assistant narration as authoritative when it invents unsupported details.
 - If assistant narration changes a practical state, include it only when the fact is clear and consistent with prior established context.
 - If new explicit text contradicts old state, prefer the latest explicit fact and include a rejected_candidate or uncertainty note.
 - Cap output to the most important Phase 1 facts. Sparse is better than complete.
+- If only ordinary conversation happened, set recent_event_updates to [] and explain rejected candidates if useful.
 - Output valid JSON only. No Markdown. No prose outside JSON.
 
 OUTPUT SHAPE:
@@ -99,6 +110,7 @@ OUTPUT SHAPE:
 
 Use null or empty arrays for no change.
 For nearby_objects_add_or_update, use objects like {"name":"Davo's mug","location":"Sage's study desk","evidence":"Turn 14: ..."}.
+For RecentEvents, causal_result is mandatory: describe the unresolved practical consequence. If no unresolved practical consequence exists, do not create the event.
 Evidence must point to source turn numbers or short quotes from the chat text.`;
 
 function ctx() {
@@ -391,6 +403,34 @@ function normalizeProposal(raw) {
             evidence: sanitizeText(e.evidence)
         }));
 
+    if (settings().strictRecentEvents) {
+        const keptEvents = [];
+        const rejectedEventCandidates = [];
+        const minImportance = Number(settings().minEventImportance || 4);
+        const maxEvents = Math.max(0, Number(settings().maxEventsPerProposal || 1));
+        for (const ev of normalized.recent_event_updates) {
+            const gate = eventGateReason(ev, minImportance);
+            if (gate) {
+                rejectedEventCandidates.push({
+                    candidate: ev.summary || ev.causal_result || '(recent event candidate)',
+                    reason: gate
+                });
+            } else {
+                keptEvents.push(ev);
+            }
+        }
+        keptEvents.sort((a, b) => Number(b.importance_score || 0) - Number(a.importance_score || 0));
+        const allowed = keptEvents.slice(0, maxEvents);
+        for (const ev of keptEvents.slice(maxEvents)) {
+            rejectedEventCandidates.push({
+                candidate: ev.summary || ev.causal_result || '(recent event candidate)',
+                reason: `Dropped by sparse event cap: max ${maxEvents} new RecentEvent(s) per extraction.`
+            });
+        }
+        normalized.recent_event_updates = allowed;
+        normalized.rejected_candidates.push(...rejectedEventCandidates);
+    }
+
     normalized.resolved_event_updates = normalized.resolved_event_updates
         .filter(e => e && (e.matches_existing_event || e.resolution || e.evidence))
         .map(e => ({
@@ -420,6 +460,34 @@ function normalizeProposal(raw) {
     if (normalized.scene_update.surroundings_summary !== null) normalized.scene_update.surroundings_summary = sanitizeText(normalized.scene_update.surroundings_summary);
 
     return normalized;
+}
+
+function eventGateReason(event, minImportance) {
+    const summary = sanitizeText(event?.summary);
+    const result = sanitizeText(event?.causal_result);
+    const evidence = sanitizeText(event?.evidence);
+    const score = Number(event?.importance_score || 0);
+    if (!summary) return 'Dropped RecentEvent candidate: missing summary.';
+    if (!result) return 'Dropped RecentEvent candidate: no unresolved practical causal result.';
+    if (!evidence) return 'Dropped RecentEvent candidate: no source evidence.';
+    if (score < minImportance) return `Dropped RecentEvent candidate: importance ${score} below strict threshold ${minImportance}.`;
+
+    const combined = `${summary} ${result}`.toLowerCase();
+    const weakPatterns = [
+        /\b(smile|smiled|grin|grinned|laugh|laughed|chuckle|chuckled|blush|blushed|sigh|sighed)\b/,
+        /\b(tease|teased|banter|flirt|flirted|joke|joked)\b/,
+        /\b(asked|said|told|replied|responded|commented|mentioned)\b/,
+        /\b(looked at|glanced|nodded|shrugged)\b/
+    ];
+    const strongPatterns = [
+        /\b(broke|broken|breaks|lost|missing|can't find|cannot find|found|hid|hidden|moved|put|placed|handed|gave|took|left|entered|arrived)\b/,
+        /\b(promised|agreed to|needs to|need to|must|deadline|urgent|interrupted|task|plan changed|change of plan|remind|remember)\b/,
+        /\b(waiting for|depends on|blocked|can't continue|cannot continue|unresolved|still needs|has to)\b/
+    ];
+    const hasStrongCue = strongPatterns.some(re => re.test(combined));
+    const onlyWeakCue = weakPatterns.some(re => re.test(combined)) && !hasStrongCue;
+    if (onlyWeakCue) return 'Dropped RecentEvent candidate: appears to be ordinary dialogue, emotional colour, or banter rather than an unresolved practical event.';
+    return '';
 }
 
 function hasSubstantiveDelta(delta) {
@@ -754,7 +822,7 @@ function renderProposalSummary(proposal) {
     for (const ev of delta.recent_event_updates || []) {
         const summary = ev.summary || '(event summary missing)';
         const result = ev.causal_result ? `; result: ${ev.causal_result}` : '';
-        lines.push(`- ADD Recent event: ${summary}${result}`);
+        lines.push(`- ADD Recent event: ${summary}${result} [importance ${Number(ev.importance_score || 0)}]`);
         if (ev.evidence) lines.push(`  Evidence: ${ev.evidence}`);
         eventCount++;
     }
@@ -863,6 +931,9 @@ function updatePanel() {
     setInputValue('sfe_max_tokens', s.maxTokens);
     setInputValue('sfe_trigger', s.trigger);
     setInputValue('sfe_json_response', s.responseFormatJson, 'checked');
+    setInputValue('sfe_strict_events', s.strictRecentEvents, 'checked');
+    setInputValue('sfe_min_event_importance', s.minEventImportance);
+    setInputValue('sfe_max_events_per_proposal', s.maxEventsPerProposal);
 
     const latest = latestProposal();
     const summaryPre = document.querySelector('#sfe_latest_summary');
@@ -919,6 +990,7 @@ function installUi() {
   <div class="sfe-row"><label for="sfe_model">Model</label><input id="sfe_model" type="text" spellcheck="false"></div>
   <div class="sfe-row"><label for="sfe_apikey">API key</label><input id="sfe_apikey" type="text" spellcheck="false" placeholder="blank for LM Studio"></div>
   <div class="sfe-row"><label for="sfe_recent_limit">Recent messages</label><input id="sfe_recent_limit" type="number" min="2" max="40" step="1"><label for="sfe_max_tokens">Max output tokens</label><input id="sfe_max_tokens" type="number" min="100" max="4000" step="50"><label><input id="sfe_json_response" type="checkbox"> Request JSON response_format</label></div>
+  <div class="sfe-row"><label><input id="sfe_strict_events" type="checkbox"> Strict RecentEvents gate</label><label for="sfe_min_event_importance">Min event importance</label><input id="sfe_min_event_importance" type="number" min="0" max="5" step="1"><label for="sfe_max_events_per_proposal">Max events/proposal</label><input id="sfe_max_events_per_proposal" type="number" min="0" max="3" step="1"></div>
 
   <div class="sfe-row sfe-buttons">
     <button id="sfe_run_now" class="menu_button">Run extraction now</button>
@@ -955,6 +1027,9 @@ function installUi() {
     bindSetting('sfe_max_tokens', 'maxTokens', 'number');
     bindSetting('sfe_trigger', 'trigger');
     bindSetting('sfe_json_response', 'responseFormatJson', 'boolean');
+    bindSetting('sfe_strict_events', 'strictRecentEvents', 'boolean');
+    bindSetting('sfe_min_event_importance', 'minEventImportance', 'number');
+    bindSetting('sfe_max_events_per_proposal', 'maxEventsPerProposal', 'number');
 
     document.getElementById('sfe_run_now')?.addEventListener('click', () => runExtraction('manual'));
     document.getElementById('sfe_apply_latest')?.addEventListener('click', async () => {

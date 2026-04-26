@@ -105,3 +105,15 @@ This is a live extraction test harness, not a final continuity system. A viabili
 - Changed the human-readable proposal summary to group proposed object updates by location.
 - Object-removal proposal lines now show the current known location when available, e.g. `- REMOVE Cafeteria table: Sage's coffee`.
 - Internal state is still object-centric (`name` + `location`) so movement and removal remain reliable; only the packet/review rendering changed.
+
+
+## v0.1.5 / Extension v06 fix
+
+- Tightened RecentEvents extraction.
+- RecentEvents are now treated as rare unresolved practical reminders, not ordinary chat progress.
+- Added strict local post-filtering before proposals reach the Apply button.
+- Default event threshold: importance score 4+ only.
+- Default cap: maximum 1 new RecentEvent per extraction pass.
+- Drops event candidates with no causal result, no evidence, weak emotional/banter/dialogue cues, or low importance.
+- Scene/object extraction and grouped object-location packet rendering are unchanged.
+- Added UI controls: `Strict RecentEvents gate`, `Min event importance`, and `Max events/proposal`.
