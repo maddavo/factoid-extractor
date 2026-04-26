@@ -1,7 +1,7 @@
 // Sage Phase 1 Factoid Extractor for SillyTavern
-// v0.1.11 — visible throttle controls and version badge.
+// v0.1.12 — scene-change stale object expiry.
 
-const EXTENSION_VERSION = '0.1.11';
+const EXTENSION_VERSION = '0.1.12';
 
 const MODULE_NAME = 'sage_phase1_factoid_extractor';
 const MODULE_TITLE = 'Sage Phase 1 Factoid Extractor';
@@ -28,6 +28,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     strictRecentEvents: true,
     minEventImportance: 4,
     maxEventsPerProposal: 1,
+    clearRoomObjectsOnLocationChange: true,
     debug: false
 });
 
@@ -74,6 +75,7 @@ STRICT RULES:
 - Output at most one new RecentEvent per extraction pass. If several candidates exist, keep only the most practically urgent one.
 - Do not treat decorative assistant narration as authoritative when it invents unsupported details.
 - If assistant narration changes a practical state, include it only when the fact is clear and consistent with prior established context.
+- If the current location/room changes, remove old room-local nearby_objects unless the object is explicitly carried into the new scene.
 - If new explicit text contradicts old state, prefer the latest explicit fact and include a rejected_candidate or uncertainty note.
 - Cap output to the most important Phase 1 facts. Sparse is better than complete.
 - If only ordinary conversation happened, set recent_event_updates to [] and explain rejected candidates if useful.
@@ -843,6 +845,24 @@ function applyProposalObject(proposal) {
     const turn = proposal.turn_count || (ctx().chat || []).length;
     const scene = m.currentScene || structuredCloneSafe(EMPTY_SCENE);
     const su = delta.scene_update || {};
+    const oldLocation = scene.location_ref || '';
+    const newLocation = su.location_ref || '';
+    const locationChanged = Boolean(newLocation && oldLocation && !sameText(oldLocation, newLocation));
+
+    scene.nearby_objects = Array.isArray(scene.nearby_objects) ? scene.nearby_objects : [];
+    if (settings().clearRoomObjectsOnLocationChange && locationChanged) {
+        const staleBefore = staleObjectsForSceneChange(su);
+        const keepNames = new Set((su.nearby_objects_add_or_update || [])
+            .map(o => canonicalKey(o?.name))
+            .filter(Boolean));
+        scene.nearby_objects = scene.nearby_objects.filter(o => keepNames.has(canonicalKey(o?.name)));
+        proposal.auto_expired_objects = staleBefore.map(o => ({
+            name: o.name,
+            location: o.location,
+            scene_ref: o.scene_ref || oldLocation,
+            reason: `Location changed from ${oldLocation} to ${newLocation}`
+        }));
+    }
 
     if (su.location_ref) scene.location_ref = su.location_ref;
     if (su.surroundings_summary) scene.surroundings_summary = su.surroundings_summary;
@@ -850,7 +870,6 @@ function applyProposalObject(proposal) {
     for (const ent of su.present_entities_add || []) addUnique(scene.present_entities, ent);
     for (const ent of su.present_entities_remove || []) removeByCaseInsensitive(scene.present_entities, ent);
 
-    scene.nearby_objects = Array.isArray(scene.nearby_objects) ? scene.nearby_objects : [];
     for (const removeName of su.nearby_objects_remove || []) {
         scene.nearby_objects = scene.nearby_objects.filter(o => !sameText(o.name, removeName));
     }
@@ -859,12 +878,14 @@ function applyProposalObject(proposal) {
         const existing = scene.nearby_objects.find(o => sameText(o.name, obj.name));
         if (existing) {
             existing.location = obj.location;
+            existing.scene_ref = scene.location_ref || existing.scene_ref || '';
             existing.evidence = obj.evidence || existing.evidence || '';
             existing.last_updated_turn = turn;
         } else {
             scene.nearby_objects.push({
                 name: obj.name,
                 location: obj.location,
+                scene_ref: scene.location_ref || '',
                 evidence: obj.evidence || '',
                 last_updated_turn: turn
             });
@@ -942,7 +963,7 @@ function groupObjectsByLocation(objects) {
     const indexByLocation = new Map();
     for (const obj of objects || []) {
         const name = sanitizeText(obj?.name);
-        const location = sanitizeText(obj?.location);
+        const location = displayLocationForObject(obj?.location, obj?.scene_ref);
         if (!name || !location) continue;
         const key = location.toLowerCase();
         let group = indexByLocation.get(key);
@@ -964,6 +985,50 @@ function findCurrentObjectLocation(objectName) {
     const scene = metadata().currentScene || EMPTY_SCENE;
     const found = (scene.nearby_objects || []).find(o => sameText(o?.name, objectName));
     return found?.location || '';
+}
+
+function canonicalKey(value) {
+    return String(value || '').trim().toLowerCase();
+}
+
+function sceneLocationWillChange(sceneUpdate) {
+    const current = sanitizeText(metadata().currentScene?.location_ref);
+    const next = sanitizeText(sceneUpdate?.location_ref);
+    return Boolean(current && next && !sameText(current, next));
+}
+
+function staleObjectsForSceneChange(sceneUpdate) {
+    if (!settings().clearRoomObjectsOnLocationChange || !sceneLocationWillChange(sceneUpdate)) return [];
+    const currentObjects = metadata().currentScene?.nearby_objects || [];
+    const explicitKeep = new Set((sceneUpdate?.nearby_objects_add_or_update || [])
+        .map(o => canonicalKey(o?.name))
+        .filter(Boolean));
+    const explicitRemove = new Set((sceneUpdate?.nearby_objects_remove || [])
+        .map(objectRemoveName)
+        .map(canonicalKey)
+        .filter(Boolean));
+    return currentObjects.filter(o => {
+        const nameKey = canonicalKey(o?.name);
+        if (!nameKey) return false;
+        if (explicitKeep.has(nameKey)) return false;
+        if (explicitRemove.has(nameKey)) return false;
+        return true;
+    });
+}
+
+function displayLocationForObject(location, sceneRef = '') {
+    const loc = sanitizeText(location);
+    const scene = sanitizeText(sceneRef || metadata().currentScene?.location_ref);
+    if (!loc) return '';
+    const text = loc.trim();
+    const hasExplicitPlace = /\b(cafeteria|dorm|bathroom|hallway|kitchen|bedroom|office|study|room|entrance)\b/i.test(text);
+    const genericLocal = /^(the\s+)?(floor|ground|desk|table|chair|bed|door|doorway|door frame|counter|bench)$/i.test(text)
+        || /^(on|under|beside|near|next to|against|by)\b/i.test(text)
+        || (/\b(floor|desk|table|chair|bed|door frame|counter|bench)\b/i.test(text) && !hasExplicitPlace);
+    if (scene && genericLocal && !text.toLowerCase().includes(scene.toLowerCase())) {
+        return `${scene} — ${text}`;
+    }
+    return text;
 }
 
 function renderPackets() {
@@ -1029,6 +1094,12 @@ function renderProposalSummary(proposal) {
     if (nonEmpty(su.location_ref)) {
         lines.push(`- SET Current location: ${su.location_ref}`);
         sceneCount++;
+        const staleObjects = staleObjectsForSceneChange(su);
+        for (const stale of staleObjects) {
+            const oldLoc = displayLocationForObject(stale.location, stale.scene_ref || metadata().currentScene?.location_ref);
+            lines.push(oldLoc ? `- AUTO-REMOVE previous scene object: ${oldLoc}: ${stale.name}` : `- AUTO-REMOVE previous scene object: ${stale.name}`);
+            sceneCount++;
+        }
     }
     for (const ent of su.present_entities_add || []) {
         lines.push(`- ADD Present entity: ${ent}`);
@@ -1049,7 +1120,7 @@ function renderProposalSummary(proposal) {
         sceneCount++;
     }
     for (const objName of su.nearby_objects_remove || []) {
-        const currentLocation = findCurrentObjectLocation(objName);
+        const currentLocation = displayLocationForObject(findCurrentObjectLocation(objName));
         lines.push(currentLocation ? `- REMOVE ${currentLocation}: ${objName}` : `- REMOVE Object/location: ${objName}`);
         sceneCount++;
     }
@@ -1144,6 +1215,17 @@ function exportControllerMarkdown() {
     downloadText('Sage_Phase1_Factoid_Extraction_Live_Run_Report.md', md, 'text/markdown');
 }
 
+function clearNearbyObjects() {
+    if (!confirm('Clear all nearby objects from the current applied scene? Use this to clean stale objects after a scene-change bug.')) return;
+    const m = metadata();
+    m.currentScene = m.currentScene || structuredCloneSafe(EMPTY_SCENE);
+    const count = Array.isArray(m.currentScene.nearby_objects) ? m.currentScene.nearby_objects.length : 0;
+    m.currentScene.nearby_objects = [];
+    saveMetadataNow();
+    updatePanel();
+    toastInfo(`Cleared ${count} nearby object(s).`);
+}
+
 function resetState() {
     if (!confirm('Reset Sage factoid extractor state for this chat?')) return;
     const context = ctx();
@@ -1182,6 +1264,7 @@ function updatePanel() {
     setInputValue('sfe_strict_events', s.strictRecentEvents, 'checked');
     setInputValue('sfe_min_event_importance', s.minEventImportance);
     setInputValue('sfe_max_events_per_proposal', s.maxEventsPerProposal);
+    setInputValue('sfe_clear_objects_on_location_change', s.clearRoomObjectsOnLocationChange, 'checked');
 
     const latest = latestProposal();
     const summaryPre = document.querySelector('#sfe_latest_summary');
@@ -1241,6 +1324,7 @@ function installUi() {
   <div class="sfe-row"><label for="sfe_apikey">API key</label><input id="sfe_apikey" type="text" spellcheck="false" placeholder="blank for LM Studio"></div>
   <div class="sfe-row"><label for="sfe_recent_limit">Recent messages</label><input id="sfe_recent_limit" type="number" min="2" max="40" step="1"><label for="sfe_max_tokens">Max output tokens</label><input id="sfe_max_tokens" type="number" min="100" max="4000" step="50"><label><input id="sfe_json_response" type="checkbox"> Request JSON response_format</label></div>
   <div class="sfe-row"><label><input id="sfe_strict_events" type="checkbox"> Strict RecentEvents gate</label><label for="sfe_min_event_importance">Min event importance</label><input id="sfe_min_event_importance" type="number" min="0" max="5" step="1"><label for="sfe_max_events_per_proposal">Max events/proposal</label><input id="sfe_max_events_per_proposal" type="number" min="0" max="3" step="1"></div>
+  <div class="sfe-row"><label><input id="sfe_clear_objects_on_location_change" type="checkbox"> Expire old room objects on location change</label><span class="sfe-small">Recommended on: prevents “The floor” objects from following Sage into a new room.</span></div>
 
   <div class="sfe-row sfe-buttons">
     <button id="sfe_run_now" class="menu_button">Run extraction now</button>
@@ -1250,6 +1334,7 @@ function installUi() {
     <button id="sfe_copy_latest" class="menu_button">Copy latest JSON</button>
     <button id="sfe_copy_packets" class="menu_button">Copy OOC packet preview</button>
     <button id="sfe_prune_events" class="menu_button">Prune weak RecentEvents</button>
+    <button id="sfe_clear_objects" class="menu_button">Clear nearby objects</button>
     <button id="sfe_export_json" class="menu_button">Export audit JSON</button>
     <button id="sfe_export_md" class="menu_button">Export controller MD</button>
     <button id="sfe_reset" class="menu_button">Reset chat state</button>
@@ -1285,6 +1370,7 @@ function installUi() {
     bindSetting('sfe_strict_events', 'strictRecentEvents', 'boolean');
     bindSetting('sfe_min_event_importance', 'minEventImportance', 'number');
     bindSetting('sfe_max_events_per_proposal', 'maxEventsPerProposal', 'number');
+    bindSetting('sfe_clear_objects_on_location_change', 'clearRoomObjectsOnLocationChange', 'boolean');
 
     document.getElementById('sfe_run_now')?.addEventListener('click', () => runExtraction('manual'));
     document.getElementById('sfe_apply_latest')?.addEventListener('click', async () => {

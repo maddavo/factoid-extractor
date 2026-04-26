@@ -1,4 +1,4 @@
-# Sage Phase 1 Factoid Extractor v0.1.11
+# Sage Phase 1 Factoid Extractor v0.1.12
 
 A review-first SillyTavern UI extension for the Sage continuity project.
 
@@ -55,6 +55,7 @@ Auto-run policy: Periodic or scene cue
 Every N user messages: 10
 Scene cue prefilter: on
 Auto-apply proposed deltas: off
+Expire old room objects on location change: on
 ```
 
 In LM Studio, start the local server and load the model you want to test as the extractor.
@@ -159,7 +160,7 @@ Auto-run policy: Periodic or explicit marker only
 ```
 
 
-## v0.1.11 throttle UI
+## v0.1.12 throttle UI
 
 This build exposes the throttle controls in the panel:
 
@@ -176,3 +177,8 @@ Auto-run policy: Periodic or scene cue
 Every N user messages: 10
 Scene cue prefilter: on
 ```
+
+
+## v0.1.12 note
+
+When the applied location changes, old room-local nearby objects are expired unless the extractor explicitly re-adds them in the new scene. This prevents generic anchors such as "The floor" from following the chat into a new room. A manual "Clear nearby objects" button is also available for cleaning already-contaminated state.
