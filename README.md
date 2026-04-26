@@ -13,9 +13,9 @@ It does **not** redesign the Sage card or preset. It does **not** build Data Ban
 
 - Auto-runs after assistant replies.
 - Sends recent chat turns plus previous applied Phase 1 state to an extractor model.
-- Stores proposed JSON deltas in the current chat metadata.
+- Stores proposed JSON deltas in the current chat metadata and displays a plain-English review summary first.
 - Does not auto-apply deltas unless you enable `Auto-apply proposed deltas`.
-- Provides buttons to apply/reject proposals, export audit JSON, and export a controller Markdown report.
+- Provides buttons to apply/reject proposals, copy the readable review summary, export audit JSON, and export a controller Markdown report.
 
 ## Installation
 
@@ -44,26 +44,26 @@ If your SillyTavern install uses the newer per-user extension location, copy the
 Recommended first test settings:
 
 ```text
-Endpoint: http://localhost:1234/v1/chat/completions
+Endpoint: /proxy/http://127.0.0.1:1234/v1/chat/completions
 Model: local-model
 API key: blank
 Temperature: 0
 Recent messages: 10
 Max output tokens: 900
-Request JSON response_format: on
+Request JSON response_format: off for first test
 Auto-apply proposed deltas: off
 ```
 
 In LM Studio, start the local server and load the model you want to test as the extractor.
 
-If the browser console reports a CORS error, the extension cannot reach LM Studio directly from the browser. In that case, use a server-side proxy or adapt the extension to call SillyTavern's own quiet generation pathway in a follow-up branch.
+This build defaults to the SillyTavern CORS proxy path. In `config.yaml`, set `enableCorsProxy: true`, then restart SillyTavern.
 
 ## Viability test workflow
 
 1. Enable the extension.
 2. Leave `Auto-apply proposed deltas` off.
 3. Chat normally in the Sage test chat.
-4. After each assistant reply, inspect `Latest extractor output`.
+4. After each assistant reply, inspect `Latest proposed packet changes`.
 5. Apply only good proposals.
 6. Reject wrong, ambiguous, or bloated proposals.
 7. At the end of a test run, click:
@@ -83,7 +83,8 @@ For each proposed delta, judge:
 - Did it update stale object locations when objects moved?
 - Did it flag or avoid ambiguity?
 - Did it avoid decorative assistant-invented details?
-- Did it output usable JSON?
+- Did the readable proposal summary make the operator decision easy?
+- Did it still export usable audit JSON?
 
 ## Important limitation
 

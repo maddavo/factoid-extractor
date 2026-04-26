@@ -1,5 +1,5 @@
 // Sage Phase 1 Factoid Extractor for SillyTavern
-// v0.1.0 — review-first, Phase 1 only: CurrentScene + RecentEvents.
+// v0.1.2 — review-first, Phase 1 only: CurrentScene + RecentEvents. Human-readable proposal summary.
 
 const MODULE_NAME = 'sage_phase1_factoid_extractor';
 const MODULE_TITLE = 'Sage Phase 1 Factoid Extractor';
@@ -8,14 +8,14 @@ const DEFAULT_SETTINGS = Object.freeze({
     enabled: false,
     autoRun: true,
     trigger: 'assistant', // assistant | user_and_assistant
-    endpoint: 'http://localhost:1234/v1/chat/completions',
+    endpoint: '/proxy/http://127.0.0.1:1234/v1/chat/completions',
     model: 'local-model',
     apiKey: '',
     temperature: 0,
     maxTokens: 900,
     recentMessageLimit: 10,
     debounceMs: 1500,
-    responseFormatJson: true,
+    responseFormatJson: false,
     autoApply: false,
     keepResolvedEvents: false,
     unresolvedEventLimit: 6,
@@ -221,6 +221,83 @@ function buildExtractorUserPayload() {
     }, null, 2);
 }
 
+function buildLmStudioJsonSchemaResponseFormat() {
+    const stringOrNull = { anyOf: [{ type: 'string' }, { type: 'null' }] };
+    const stringArray = { type: 'array', items: { type: 'string' } };
+    return {
+        type: 'json_schema',
+        json_schema: {
+            name: 'sage_phase1_factoid_delta',
+            schema: {
+                type: 'object',
+                properties: {
+                    scene_update: {
+                        type: 'object',
+                        properties: {
+                            location_ref: stringOrNull,
+                            present_entities_add: stringArray,
+                            present_entities_remove: stringArray,
+                            nearby_objects_add_or_update: {
+                                type: 'array',
+                                items: {
+                                    type: 'object',
+                                    properties: {
+                                        name: { type: 'string' },
+                                        location: { type: 'string' },
+                                        evidence: { type: 'string' }
+                                    }
+                                }
+                            },
+                            nearby_objects_remove: stringArray,
+                            surroundings_summary: stringOrNull
+                        },
+                        required: ['location_ref', 'present_entities_add', 'present_entities_remove', 'nearby_objects_add_or_update', 'nearby_objects_remove', 'surroundings_summary']
+                    },
+                    recent_event_updates: {
+                        type: 'array',
+                        items: {
+                            type: 'object',
+                            properties: {
+                                summary: { type: 'string' },
+                                causal_result: { type: 'string' },
+                                resolved: { type: 'boolean' },
+                                importance_score: { type: 'number' },
+                                evidence: { type: 'string' }
+                            },
+                            required: ['summary', 'causal_result', 'resolved', 'importance_score', 'evidence']
+                        }
+                    },
+                    resolved_event_updates: {
+                        type: 'array',
+                        items: {
+                            type: 'object',
+                            properties: {
+                                matches_existing_event: { type: 'string' },
+                                resolution: { type: 'string' },
+                                evidence: { type: 'string' }
+                            },
+                            required: ['matches_existing_event', 'resolution', 'evidence']
+                        }
+                    },
+                    rejected_candidates: {
+                        type: 'array',
+                        items: {
+                            type: 'object',
+                            properties: {
+                                candidate: { type: 'string' },
+                                reason: { type: 'string' }
+                            },
+                            required: ['candidate', 'reason']
+                        }
+                    },
+                    no_update_reason: { type: 'string' }
+                },
+                required: ['scene_update', 'recent_event_updates', 'resolved_event_updates', 'rejected_candidates', 'no_update_reason']
+            }
+        }
+    };
+}
+
 async function callExtractor(promptPayload) {
     const s = settings();
     const headers = { 'Content-Type': 'application/json' };
@@ -238,7 +315,7 @@ async function callExtractor(promptPayload) {
     };
 
     if (s.responseFormatJson) {
-        body.response_format = { type: 'json_object' };
+        body.response_format = buildLmStudioJsonSchemaResponseFormat();
     }
 
     const response = await fetch(s.endpoint, {
@@ -553,6 +630,110 @@ function renderPackets() {
     return `${scenePacket}\n\n${eventPacket}`;
 }
 
+
+function nonEmpty(value) {
+    return String(value || '').trim().length > 0;
+}
+
+function packetLineForObject(obj) {
+    if (!obj?.name && !obj?.location) return '';
+    if (obj.name && obj.location) return `${obj.name}: ${obj.location}`;
+    return obj.name || obj.location || '';
+}
+
+function renderProposalSummary(proposal) {
+    if (!proposal) return 'No extractor output yet.';
+    const delta = proposal.delta || {};
+    const su = delta.scene_update || {};
+    const lines = [];
+    const substantive = hasSubstantiveDelta(delta);
+
+    lines.push(`Status: ${proposal.status || 'unknown'}`);
+    lines.push(`Reason: ${proposal.reason || 'unknown'}`);
+    lines.push(`Turn count: ${proposal.turn_count ?? 'unknown'}`);
+    lines.push('');
+
+    if (!substantive) {
+        lines.push('NO UPDATE');
+        lines.push(delta.no_update_reason ? `Reason: ${delta.no_update_reason}` : 'Reason: extractor found no Phase 1 continuity change.');
+        if (delta.rejected_candidates?.length) {
+            lines.push('');
+            lines.push('Rejected candidates:');
+            for (const r of delta.rejected_candidates) {
+                lines.push(`- REJECT ${r.candidate || '(candidate)'} — ${r.reason || 'not Phase 1 / not supported'}`);
+            }
+        }
+        return lines.join('\n');
+    }
+
+    lines.push('PROPOSED OOC PACKET CHANGES');
+    lines.push('');
+    lines.push('sap_inj_scene:');
+
+    let sceneCount = 0;
+    if (nonEmpty(su.location_ref)) {
+        lines.push(`- SET Current location: ${su.location_ref}`);
+        sceneCount++;
+    }
+    for (const ent of su.present_entities_add || []) {
+        lines.push(`- ADD Present entity: ${ent}`);
+        sceneCount++;
+    }
+    for (const ent of su.present_entities_remove || []) {
+        lines.push(`- REMOVE Present entity: ${ent}`);
+        sceneCount++;
+    }
+    for (const obj of su.nearby_objects_add_or_update || []) {
+        const line = packetLineForObject(obj);
+        if (line) {
+            lines.push(`- ADD/UPDATE Object location: ${line}`);
+            if (obj.evidence) lines.push(`  Evidence: ${obj.evidence}`);
+            sceneCount++;
+        }
+    }
+    for (const objName of su.nearby_objects_remove || []) {
+        lines.push(`- REMOVE Object/location: ${objName}`);
+        sceneCount++;
+    }
+    if (nonEmpty(su.surroundings_summary)) {
+        lines.push(`- SET Surroundings: ${su.surroundings_summary}`);
+        sceneCount++;
+    }
+    if (!sceneCount) lines.push('- No scene packet change proposed.');
+
+    lines.push('');
+    lines.push('sap_inj_recent_events:');
+
+    let eventCount = 0;
+    for (const ev of delta.recent_event_updates || []) {
+        const summary = ev.summary || '(event summary missing)';
+        const result = ev.causal_result ? `; result: ${ev.causal_result}` : '';
+        lines.push(`- ADD Recent event: ${summary}${result}`);
+        if (ev.evidence) lines.push(`  Evidence: ${ev.evidence}`);
+        eventCount++;
+    }
+    for (const res of delta.resolved_event_updates || []) {
+        lines.push(`- RESOLVE/REMOVE Recent event: ${res.matches_existing_event || '(existing event)'} → ${res.resolution || 'resolved'}`);
+        if (res.evidence) lines.push(`  Evidence: ${res.evidence}`);
+        eventCount++;
+    }
+    if (!eventCount) lines.push('- No recent-events packet change proposed.');
+
+    if (delta.rejected_candidates?.length) {
+        lines.push('');
+        lines.push('REJECTED BY EXTRACTOR');
+        for (const r of delta.rejected_candidates) {
+            lines.push(`- REJECT ${r.candidate || '(candidate)'} — ${r.reason || 'not Phase 1 / not supported'}`);
+        }
+    }
+
+    lines.push('');
+    lines.push('OPERATOR DECISION');
+    lines.push('- Apply only if every ADD/SET/REMOVE line is explicit, sparse, accurate, and Phase 1 relevant.');
+    lines.push('- Reject if any line is guessed, bloated, ambiguous, or based on unsupported assistant narration.');
+    return lines.join('\n');
+}
+
 function latestProposal() {
     return metadata().pendingProposals?.[0] || null;
 }
@@ -638,6 +819,9 @@ function updatePanel() {
     setInputValue('sfe_json_response', s.responseFormatJson, 'checked');
 
     const latest = latestProposal();
+    const summaryPre = document.querySelector('#sfe_latest_summary');
+    if (summaryPre) summaryPre.textContent = renderProposalSummary(latest);
+
     const proposalPre = document.querySelector('#sfe_latest_proposal');
     if (proposalPre) proposalPre.textContent = latest ? JSON.stringify(latest, null, 2) : 'No extractor output yet.';
 
@@ -694,6 +878,7 @@ function installUi() {
     <button id="sfe_run_now" class="menu_button">Run extraction now</button>
     <button id="sfe_apply_latest" class="menu_button">Apply latest pending</button>
     <button id="sfe_reject_latest" class="menu_button">Reject latest pending</button>
+    <button id="sfe_copy_summary" class="menu_button">Copy review summary</button>
     <button id="sfe_copy_latest" class="menu_button">Copy latest JSON</button>
     <button id="sfe_copy_packets" class="menu_button">Copy OOC packet preview</button>
     <button id="sfe_export_json" class="menu_button">Export audit JSON</button>
@@ -704,7 +889,8 @@ function installUi() {
   <div id="sfe_status" class="sfe-status-warn">Idle.</div>
   <div id="sfe_counts" class="sfe-small"></div>
 
-  <details open><summary>Latest extractor output</summary><pre id="sfe_latest_proposal"></pre></details>
+  <details open><summary>Latest proposed packet changes</summary><pre id="sfe_latest_summary"></pre></details>
+  <details><summary>Raw latest extractor JSON</summary><pre id="sfe_latest_proposal"></pre></details>
   <details><summary>Applied Phase 1 state</summary><pre id="sfe_state_preview"></pre></details>
   <details><summary>Rendered OOC packet preview</summary><pre id="sfe_packet_preview"></pre></details>
 </div>`;
@@ -741,6 +927,7 @@ function installUi() {
         updatePanel();
         toastInfo('Latest pending proposal rejected.');
     });
+    document.getElementById('sfe_copy_summary')?.addEventListener('click', () => copyToClipboard(renderProposalSummary(latestProposal())));
     document.getElementById('sfe_copy_latest')?.addEventListener('click', () => copyToClipboard(JSON.stringify(latestProposal() || {}, null, 2)));
     document.getElementById('sfe_copy_packets')?.addEventListener('click', () => copyToClipboard(renderPackets()));
     document.getElementById('sfe_export_json')?.addEventListener('click', exportAuditJson);
