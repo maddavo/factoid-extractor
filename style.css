@@ -1,0 +1,62 @@
+#sage_factoid_extractor_panel {
+  border: 1px solid var(--SmartThemeBorderColor, #666);
+  border-radius: 8px;
+  padding: 10px;
+  margin: 8px 0;
+}
+
+#sage_factoid_extractor_panel .sfe-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin: 6px 0;
+}
+
+#sage_factoid_extractor_panel label {
+  min-width: 150px;
+}
+
+#sage_factoid_extractor_panel input[type="text"],
+#sage_factoid_extractor_panel input[type="number"],
+#sage_factoid_extractor_panel textarea,
+#sage_factoid_extractor_panel select {
+  flex: 1 1 220px;
+  min-width: 160px;
+}
+
+#sage_factoid_extractor_panel textarea {
+  min-height: 80px;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+#sage_factoid_extractor_panel pre {
+  max-height: 260px;
+  overflow: auto;
+  white-space: pre-wrap;
+  padding: 8px;
+  border-radius: 6px;
+  background: rgba(127,127,127,0.12);
+  font-size: 12px;
+}
+
+#sage_factoid_extractor_panel .sfe-small {
+  font-size: 12px;
+  opacity: 0.8;
+}
+
+#sage_factoid_extractor_panel .sfe-status-ok {
+  color: #47b36b;
+}
+
+#sage_factoid_extractor_panel .sfe-status-warn {
+  color: #d1a135;
+}
+
+#sage_factoid_extractor_panel .sfe-status-bad {
+  color: #d85d5d;
+}
+
+#sage_factoid_extractor_panel .sfe-buttons button {
+  margin: 2px;
+}
