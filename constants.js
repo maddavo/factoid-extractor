@@ -1,7 +1,7 @@
 // Sage Phase 1 Factoid Extractor shared constants
-// v0.1.24 — split source modules.
+// v0.1.25 — fix recentChatText import in reconciliation module.
 
-export const EXTENSION_VERSION = '0.1.24';
+export const EXTENSION_VERSION = '0.1.25';
 
 export const MODULE_NAME = 'sage_phase1_factoid_extractor';
 export const MODULE_TITLE = 'Sage Phase 1 Factoid Extractor';
@@ -44,3 +44,4 @@ export const EMPTY_SCENE = Object.freeze({
     surroundings_summary: '',
     last_updated_turn: 0
 });
+

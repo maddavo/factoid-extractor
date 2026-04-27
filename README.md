@@ -1,3 +1,16 @@
+# Sage Phase 1 Factoid Extractor v0.1.25
+
+## v0.1.25 changes
+
+- Fixes a v0.1.24 modular-refactor runtime error: `recentChatText is not defined`.
+- Adds the missing `recentChatText` import to `reconcile.js`.
+- Bumps the operator/displayed extension version to `0.1.25`.
+- Leaves the v0.1.24 modular file split intact.
+
+## v0.1.25 reason
+
+The v0.1.24 refactor moved shared chat helper functions into `state.js`. `index.js` imported `recentChatText` correctly, but `reconcile.js` also used `recentChatText(12)` inside split-scene reconciliation and did not import it. That caused extractor runs to fail at runtime.
+
 # Sage Phase 1 Factoid Extractor v0.1.24
 
 ## v0.1.24 changes
