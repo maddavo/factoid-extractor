@@ -3,9 +3,9 @@
   "loading_order": 20,
   "requires": [],
   "optional": [],
-  "js": "index.js",
+  "js": "loader.js",
   "css": "style.css",
   "author": "OpenAI ChatGPT for Dave",
-  "version": "0.1.22",
+  "version": "0.1.23",
   "homePage": ""
 }
