@@ -1,3 +1,33 @@
+# Sage Phase 1 Factoid Extractor v0.1.24
+
+## v0.1.24 changes
+
+- Refactors the large monolithic `index.js` into smaller ES module files so the GitHub connector can reliably fetch/edit source files.
+- Keeps the runtime entry chain unchanged: `manifest.json` loads `loader.js`, and `loader.js` imports `index.js`.
+- Moves shared constants/settings defaults into `constants.js`.
+- Moves the extractor system prompt into `prompt.js`.
+- Moves the LM Studio JSON schema builder into `schema.js`.
+- Moves local-model JSON parsing/repair helpers into `json-repair.js`.
+- Moves SillyTavern context/settings/metadata/text helpers into `state.js`.
+- Moves scene reconciliation, object coalescing, proposal normalization, and RecentEvents gates into `reconcile.js`.
+- Keeps operator UI/runtime orchestration in `index.js`.
+- No intended behavioural extractor logic change; this is a maintainability/refactor update.
+
+## v0.1.24 source file size policy
+
+The GitHub connector test branch showed clean fetches below the practical cutoff and truncation near the high-60 KB range. Keep source files comfortably below that limit.
+
+Recommended project limits:
+
+```text
+Preferred max per JS file: 40 KB
+Soft ceiling: 50 KB
+Hard ceiling: 60 KB
+Avoid relying on connector reads above: ~65 KB
+```
+
+Current refactored JS file sizes are below the hard ceiling.
+
 # Sage Phase 1 Factoid Extractor v0.1.23
 
 ## v0.1.23 changes
