@@ -1,7 +1,7 @@
 // Sage Phase 1 Factoid Extractor for SillyTavern
-// v0.1.20 — conservative object coalescing.
+// v0.1.21 — participant/body-state scene reconciliation.
 
-const EXTENSION_VERSION = '0.1.20';
+const EXTENSION_VERSION = '0.1.21';
 
 const MODULE_NAME = 'sage_phase1_factoid_extractor';
 const MODULE_TITLE = 'Sage Phase 1 Factoid Extractor';
@@ -33,6 +33,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     clearRoomObjectsOnLocationChange: true,
     surroundingsUpdateMode: 'location_only', // location_only | normal
     objectCoalescingMode: 'conservative', // conservative | off
+    sceneReconciliationMode: 'suppress_participant_blocking', // suppress_participant_blocking | off
     debug: false
 });
 
@@ -54,6 +55,7 @@ PHASE 1 STATE ONLY:
 - currently present people/entities
 - nearby practical objects
 - object locations
+- do not store participants/characters as nearby_objects; participants belong in present_entities
 - one short surroundings summary only if it materially anchors the scene
 - surroundings_summary should be stable environmental context, not body/pose/blocking description
 - split-location remote communication is allowed in CurrentScene using schema-pure text fields
@@ -72,6 +74,9 @@ STRICT RULES:
 - Do not invent.
 - Preserve actor/object names.
 - For nearby_objects_remove, output only the object name as a string, never an object.
+- Do not use nearby_objects to store participant body position, sexual blocking, sitting/standing/leaning/straddling/contact, or who is next to whom.
+- If Davo, Sage, Quinn, Maya, Josy, or another active character is physically present, store them in present_entities, not as an object on the couch/bed/floor.
+- Clothing/items may be stored only when they have a stable object location, e.g. "Davo's pants: floor near the couch". Do not store transient contact such as "Sage's bodysuit: being touched by Davo".
 - Avoid pronouns in stored facts.
 - Do not store mood as a scene fact.
 - Do not update surroundings_summary for sexual/body-position/blocking changes, touch/grab/kiss/intensity/mood/decorative detail, or ordinary physical interaction.
@@ -92,10 +97,11 @@ STRICT RULES:
 - For split-location remote communication, use schema-pure fields: set location_ref to a concise split scene such as "Split scene: Davo in HOTs kitchen; Sage in Exam Hall"; remove unqualified co-present entities such as "Davo" and "Sage Morgan-Burke" if they were previously present together; add qualified entities such as "Davo — local, HOTs kitchen" and "Sage Morgan-Burke — remote, Exam Hall, texting by phone"; put the communication mode in surroundings_summary, e.g. "Davo and Sage are communicating by text while physically separated."
 - For split-location scenes, object locations must include which physical side they belong to, e.g. "HOTs kitchen counter" or "Exam Hall desk". Do not use generic locations like "the floor" without a side/location.
 - If the current location/room changes, remove old room-local nearby_objects unless the object is explicitly carried into the new scene.
+- Prefer latest explicit physical state over older conflicting physical/blocking facts. Do not preserve stale sexual/body-position facts from earlier in the scene.
 - Coalesce interchangeable objects when they share the same current location/container. Prefer "$40 cash in Davo's pocket" over four separate "$10 cash from X" objects. Do not coalesce unique/personal/named objects such as phones, keys, notes, letters, weapons, evidence, gifts, clothing, bags, or identity-specific items.
 - If new explicit text contradicts old state, prefer the latest explicit fact and include a rejected_candidate or uncertainty note.
 - Cap output to the most important Phase 1 facts. Sparse is better than complete.
-- If only ordinary conversation happened, set recent_event_updates to [] and explain rejected candidates if useful.
+- Social shock, sexual escalation, and scandal/colour are not RecentEvents unless they create a durable relationship/status/protocol fact or an unresolved practical consequence. If only ordinary conversation happened, set recent_event_updates to [] and explain rejected candidates if useful.
 - Output valid JSON only. No Markdown. No prose outside JSON.
 
 OUTPUT SHAPE:
@@ -622,6 +628,161 @@ function extractJsonValueForKey(text, key) {
     return null;
 }
 
+
+const KNOWN_CHARACTER_ALIASES = Object.freeze([
+    'davo',
+    'sage',
+    'sage morgan-burke',
+    'quinn',
+    'maya',
+    'maya bailey',
+    'josy',
+    'josy taylor',
+    'jill',
+    'bella',
+    'isabella',
+    'zoey',
+    'riona',
+    'camila',
+    'lily',
+    'nicole',
+    'sarah',
+    'melanie',
+    'heather'
+]);
+
+function sceneReconciliationEnabled() {
+    return (settings().sceneReconciliationMode || 'suppress_participant_blocking') !== 'off';
+}
+
+function stripEntityQualifier(value) {
+    return sanitizeText(value)
+        .replace(/\s+—.*$/g, '')
+        .replace(/\s+-\s+(?:local|remote|present|texting|phone).*$/i, '')
+        .trim();
+}
+
+function canonicalEntityAlias(value) {
+    return stripEntityQualifier(value)
+        .toLowerCase()
+        .replace(/[’']/g, '')
+        .replace(/[^a-z0-9\s-]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function addEntityAliases(set, value) {
+    const full = canonicalEntityAlias(value);
+    if (!full) return;
+    set.add(full);
+    const first = full.split(/\s+/)[0];
+    if (first) set.add(first);
+}
+
+function knownEntityAliasSet(delta = null) {
+    const aliases = new Set(KNOWN_CHARACTER_ALIASES);
+    const current = metadata().currentScene || EMPTY_SCENE;
+    for (const ent of current.present_entities || []) addEntityAliases(aliases, ent);
+    const su = delta?.scene_update || {};
+    for (const ent of su.present_entities_add || []) addEntityAliases(aliases, ent);
+    for (const ent of su.present_entities_remove || []) addEntityAliases(aliases, ent);
+    return aliases;
+}
+
+function isParticipantObjectName(name, delta = null) {
+    const full = canonicalEntityAlias(name);
+    if (!full) return false;
+    const aliases = knownEntityAliasSet(delta);
+    return aliases.has(full);
+}
+
+function isBodyPartOrTransientContactObjectName(name) {
+    const t = sanitizeText(name).toLowerCase();
+    if (!t) return false;
+    const possessive = /(?:davo|sage|quinn|maya|josy|jill|bella|zoey|riona|camila|lily|nicole|sarah|melanie|heather|his|her|their)[’']?s?\s+/i.test(t);
+    const bodyPart = /\b(waist|hips?|hip|chest|thighs?|legs?|arms?|hands?|fingers?|mouth|lips?|neck|shoulders?|back|body|bodies|skin|hair|face|ass|butt|crotch|cock|pussy|breasts?|nipples?)\b/i.test(t);
+    return possessive && bodyPart;
+}
+
+function isTransientParticipantLocation(location) {
+    const t = sanitizeText(location).toLowerCase();
+    if (!t) return false;
+    return /\b(standing|sitting next to|sitting beside|moving toward|moves toward|walking toward|space between|between .* and|beside .* hip|near .* hip|in .* grasp|being touched|touching|grabbed|grabbing|held by|holding|pressed against|pressing against|leaning|straddl|kneel|on top of|underneath|behind .* body|against him|against her|kiss|kissing|sexual position|body position|blocking)\b/i.test(t);
+}
+
+function hasStableObjectAnchor(location) {
+    const t = sanitizeText(location).toLowerCase();
+    if (!t) return false;
+    return /\b(couch|bed|floor|table|desk|chair|counter|bench|bag|pocket|drawer|shelf|tripod|green-screen|camera|room|kitchen|bathroom|shower|door|wall|loungeroom|apartment|mansion|hallway|bar|bin|trash|basket)\b/i.test(t);
+}
+
+function shouldRejectSceneObject(obj, delta = null) {
+    const name = sanitizeText(obj?.name);
+    const location = sanitizeText(obj?.location);
+    if (!name || !location) return { reject: false, reason: '' };
+    if (isParticipantObjectName(name, delta)) {
+        return { reject: true, reason: 'Participant/body-blocking facts belong in present_entities, not nearby_objects.' };
+    }
+    if (isBodyPartOrTransientContactObjectName(name)) {
+        return { reject: true, reason: 'Body parts and transient physical contact are not stable nearby practical objects.' };
+    }
+    if (isTransientParticipantLocation(location) && !hasStableObjectAnchor(location)) {
+        return { reject: true, reason: 'Transient pose/contact/blocking location is not a stable object location.' };
+    }
+    if (/\b(unzipped|being touched|being grabbed|being held|pressed against|skin|body)\b/i.test(location) && !hasStableObjectAnchor(location)) {
+        return { reject: true, reason: 'Transient clothing/body interaction is not a stable scene object location.' };
+    }
+    return { reject: false, reason: '' };
+}
+
+function filterParticipantBlockingDelta(delta) {
+    if (!sceneReconciliationEnabled()) return delta;
+    const su = delta?.scene_update || {};
+    if (!Array.isArray(su.nearby_objects_add_or_update)) return delta;
+
+    const rejected = [];
+    const kept = [];
+    su.present_entities_add = su.present_entities_add || [];
+
+    for (const obj of su.nearby_objects_add_or_update) {
+        const name = sanitizeText(obj?.name);
+        const location = sanitizeText(obj?.location);
+        const decision = shouldRejectSceneObject({ name, location }, delta);
+        if (decision.reject) {
+            rejected.push({ candidate: `${location}: ${name}`, reason: decision.reason });
+            if (isParticipantObjectName(name, delta)) {
+                const ent = stripEntityQualifier(name);
+                const currentPresent = metadata().currentScene?.present_entities || [];
+                const alreadyPresent = currentPresent.some(existing => sameText(stripEntityQualifier(existing), ent))
+                    || su.present_entities_add.some(existing => sameText(stripEntityQualifier(existing), ent));
+                if (ent && !alreadyPresent) su.present_entities_add.push(ent);
+            }
+            continue;
+        }
+        kept.push(obj);
+    }
+
+    su.nearby_objects_add_or_update = kept;
+    if (rejected.length) {
+        delta.rejected_candidates = [ ...(delta.rejected_candidates || []), ...rejected ];
+        if (!hasSubstantiveDelta(delta) && !delta.no_update_reason) {
+            delta.no_update_reason = 'Extractor proposed only transient participant/body-position facts; no stable Phase 1 scene update remains.';
+        }
+    }
+    return delta;
+}
+
+function reconcileSceneObjectsForStorage(scene) {
+    if (!sceneReconciliationEnabled()) return scene;
+    const kept = [];
+    for (const obj of scene.nearby_objects || []) {
+        const decision = shouldRejectSceneObject(obj, { scene_update: { present_entities_add: scene.present_entities || [] } });
+        if (!decision.reject) kept.push(obj);
+    }
+    scene.nearby_objects = kept;
+    return scene;
+}
+
 function objectCoalescingEnabled() {
     return (settings().objectCoalescingMode || 'conservative') !== 'off';
 }
@@ -860,6 +1021,7 @@ function normalizeProposal(raw) {
     if (normalized.scene_update.location_ref !== null) normalized.scene_update.location_ref = sanitizeText(normalized.scene_update.location_ref);
     if (normalized.scene_update.surroundings_summary !== null) normalized.scene_update.surroundings_summary = sanitizeText(normalized.scene_update.surroundings_summary);
 
+    filterParticipantBlockingDelta(normalized);
     normalizeSplitRemoteSceneDelta(normalized);
     filterSurroundingsDelta(normalized);
     coalesceSceneUpdateObjects(normalized);
@@ -1074,8 +1236,14 @@ function eventGateReason(event, minImportance, sceneUpdate = null) {
     const combined = `${summary} ${result}`.toLowerCase();
 
     const relationshipStatusPattern = /\b(girlfriend|boyfriend|partner|relationship|dating|official|couple|accepted .* request|agreed .* relationship|relationship status changed|became .* girlfriend|became .* boyfriend|became .* partner)\b/;
-    const roleStatusPattern = /\b(master|mistress|dominant|submissive|dom\b|sub\b|owner|owned by|belong to|belongs to|claimed by|claim(?:ed)? .* as|designat(?:ed|es) .* as|called .* master|calls .* master|relationship\/role status changed|role status changed)\b/;
-    const hasRelationshipStatusCue = relationshipStatusPattern.test(combined) || roleStatusPattern.test(combined);
+    const durableRoleStatusPattern = /\b(designat(?:ed|es)|establish(?:ed|es)|accepted|agreed|acknowledg(?:ed|es)|relationship\/role status changed|role status changed|explicitly .* as|called .* master|calls .* master|called .* mistress|calls .* mistress|safe word|safeword|protocol)\b/;
+    const roleStatusPattern = /\b(master|mistress|dominant|submissive|dom\b|sub\b|owner|owned by|belong to|belongs to|claimed by|claim(?:ed)? .* as)\b/;
+    const hasRelationshipStatusCue = relationshipStatusPattern.test(combined) || (roleStatusPattern.test(combined) && durableRoleStatusPattern.test(combined));
+
+    const socialSexualColour = /\b(sexual|intimacy|intimate|undressed|removed .* pants|partially undressed|scandal|scandalous|shock|shocked|tension|social dynamic|escalated|highly sexualized|flirt|banter)\b/;
+    if (socialSexualColour.test(combined) && !hasRelationshipStatusCue && !/\b(safe word|safeword|protocol|must respond|rule)\b/.test(combined)) {
+        return 'Dropped RecentEvent candidate: social/sexual colour or transient escalation, not a durable Phase 1 event.';
+    }
 
     const unresolvedPracticalPatterns = [
         /\b(broke|broken|breaks|damaged|damage|lost|missing|can't find|cannot find|not found|hid|hidden|stolen)\b/,
@@ -1327,6 +1495,7 @@ function applyProposalObject(proposal) {
     }
 
     scene.nearby_objects = coalesceNearbyObjects(scene.nearby_objects, scene.location_ref || oldLocation, turn);
+    reconcileSceneObjectsForStorage(scene);
 
     if (!staleSceneProposal && hasSubstantiveDelta(effectiveDelta)) scene.last_updated_turn = turn;
     m.currentScene = scene;
@@ -1708,6 +1877,18 @@ async function coalesceCurrentObjects() {
     toastInfo(`Coalesced nearby objects: ${before} → ${after}.`);
 }
 
+async function reconcileCurrentScene() {
+    const m = metadata();
+    const scene = m.currentScene || structuredCloneSafe(EMPTY_SCENE);
+    const before = Array.isArray(scene.nearby_objects) ? scene.nearby_objects.length : 0;
+    reconcileSceneObjectsForStorage(scene);
+    const after = scene.nearby_objects.length;
+    m.currentScene = scene;
+    await saveMetadataNow();
+    updatePanel();
+    toastInfo(`Reconciled scene objects: ${before} → ${after}.`);
+}
+
 function resetState() {
     if (!confirm('Reset Sage factoid extractor state for this chat?')) return;
     const context = ctx();
@@ -1751,6 +1932,7 @@ function updatePanel() {
     setInputValue('sfe_clear_objects_on_location_change', s.clearRoomObjectsOnLocationChange, 'checked');
     setInputValue('sfe_surroundings_mode', s.surroundingsUpdateMode || 'location_only');
     setInputValue('sfe_object_coalescing_mode', s.objectCoalescingMode || 'conservative');
+    setInputValue('sfe_scene_reconciliation_mode', s.sceneReconciliationMode || 'suppress_participant_blocking');
 
     const latest = reviewProposal();
     const summaryPre = document.querySelector('#sfe_latest_summary');
@@ -1819,6 +2001,7 @@ function installUi() {
   <div class="sfe-row"><label><input id="sfe_clear_objects_on_location_change" type="checkbox"> Expire old room objects on location change</label><span class="sfe-small">Recommended on: prevents “The floor” objects from following Sage into a new room.</span></div>
   <div class="sfe-row"><label for="sfe_surroundings_mode">Surroundings update mode</label><select id="sfe_surroundings_mode"><option value="location_only">Location/sub-location/environment only</option><option value="normal">Normal extractor output</option></select><span class="sfe-small">Default suppresses body-position, touch, intensity, mood, and decorative surroundings churn.</span></div>
   <div class="sfe-row"><label for="sfe_object_coalescing_mode">Object coalescing mode</label><select id="sfe_object_coalescing_mode"><option value="conservative">Conservative: cash + identical generic objects</option><option value="off">Off</option></select><span class="sfe-small">Combines interchangeable same-location objects, e.g. multiple $10 payments into one cash total.</span></div>
+  <div class="sfe-row"><label for="sfe_scene_reconciliation_mode">Scene reconciliation mode</label><select id="sfe_scene_reconciliation_mode"><option value="suppress_participant_blocking">Suppress participant/body-position objects</option><option value="off">Off</option></select><span class="sfe-small">Prevents Davo/Sage/Quinn/Maya/Josy and transient blocking from being stored as nearby objects.</span></div>
 
   <div class="sfe-row sfe-buttons">
     <button id="sfe_run_now" class="menu_button">Run extraction now</button>
@@ -1830,6 +2013,7 @@ function installUi() {
     <button id="sfe_prune_events" class="menu_button">Prune weak RecentEvents</button>
     <button id="sfe_clear_objects" class="menu_button">Clear nearby objects</button>
     <button id="sfe_coalesce_objects" class="menu_button">Coalesce current objects</button>
+    <button id="sfe_reconcile_scene" class="menu_button">Reconcile current scene</button>
     <button id="sfe_export_json" class="menu_button">Export audit JSON</button>
     <button id="sfe_export_md" class="menu_button">Export controller MD</button>
     <button id="sfe_reset" class="menu_button">Reset chat state</button>
@@ -1871,6 +2055,7 @@ function installUi() {
     bindSetting('sfe_clear_objects_on_location_change', 'clearRoomObjectsOnLocationChange', 'boolean');
     bindSetting('sfe_surroundings_mode', 'surroundingsUpdateMode');
     bindSetting('sfe_object_coalescing_mode', 'objectCoalescingMode');
+    bindSetting('sfe_scene_reconciliation_mode', 'sceneReconciliationMode');
 
     document.getElementById('sfe_run_now')?.addEventListener('click', () => runExtraction('manual'));
     document.getElementById('sfe_apply_latest')?.addEventListener('click', async () => {
@@ -1895,6 +2080,7 @@ function installUi() {
     document.getElementById('sfe_prune_events')?.addEventListener('click', () => pruneStoredRecentEvents());
     document.getElementById('sfe_clear_objects')?.addEventListener('click', () => clearNearbyObjects());
     document.getElementById('sfe_coalesce_objects')?.addEventListener('click', () => coalesceCurrentObjects());
+    document.getElementById('sfe_reconcile_scene')?.addEventListener('click', () => reconcileCurrentScene());
     document.getElementById('sfe_export_json')?.addEventListener('click', exportAuditJson);
     document.getElementById('sfe_export_md')?.addEventListener('click', exportControllerMarkdown);
     document.getElementById('sfe_reset')?.addEventListener('click', resetState);

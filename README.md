@@ -1,3 +1,14 @@
+# Sage Phase 1 Factoid Extractor v0.1.21
+
+## v0.1.21 changes
+
+- Adds scene reconciliation for long/complex physical scenes.
+- Suppresses participants/characters being stored as nearby objects, e.g. `The couch: Davo`.
+- Suppresses transient body-position/contact/blocking object facts such as sitting next to, moving toward, in someone’s grasp, or being touched.
+- Adds **Scene reconciliation mode** and **Reconcile current scene** button.
+- Tightens RecentEvents so social/sexual colour or transient escalation is rejected unless it creates a durable relationship/status/protocol fact or unresolved practical consequence.
+- Retains all v0.1.20 conservative object coalescing.
+
 # Sage Phase 1 Factoid Extractor v0.1.20
 
 ## v0.1.20 changes
