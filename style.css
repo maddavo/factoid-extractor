@@ -62,3 +62,139 @@
 }
 
 .sfe-version { font-size: 0.75em; opacity: 0.75; font-weight: normal; margin-left: 0.35em; }
+
+#sage_factoid_extractor_panel .sfe-topbar {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+
+#sage_factoid_extractor_panel .sfe-topbar h3 {
+  margin: 0 0 3px 0;
+}
+
+#sage_factoid_extractor_panel .sfe-topchecks {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+#sage_factoid_extractor_panel .sfe-topchecks label {
+  min-width: unset;
+}
+
+#sage_factoid_extractor_panel .sfe-counts {
+  line-height: 1.25;
+}
+
+#sage_factoid_extractor_panel .sfe-section {
+  border: 1px solid rgba(127,127,127,0.25);
+  border-radius: 7px;
+  padding: 6px;
+  margin: 8px 0;
+}
+
+#sage_factoid_extractor_panel .sfe-section > summary {
+  cursor: pointer;
+  font-weight: 600;
+  margin: -2px 0 6px 0;
+}
+
+#sage_factoid_extractor_panel .sfe-actionbar {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  padding: 6px;
+  margin: 4px 0 8px 0;
+  border: 1px solid rgba(127,127,127,0.25);
+  border-radius: 7px;
+  background: var(--SmartThemeBlurTintColor, rgba(20,20,20,0.92));
+}
+
+#sage_factoid_extractor_panel .sfe-primary-action {
+  font-weight: 700;
+}
+
+#sage_factoid_extractor_panel .sfe-danger-action {
+  font-weight: 700;
+}
+
+#sage_factoid_extractor_panel .sfe-review-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(260px, 1fr));
+  gap: 8px;
+  align-items: stretch;
+  overflow-x: auto;
+}
+
+#sage_factoid_extractor_panel .sfe-review-card {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+#sage_factoid_extractor_panel .sfe-card-title {
+  font-weight: 600;
+  font-size: 12px;
+  opacity: 0.9;
+  margin: 0 0 4px 0;
+}
+
+#sage_factoid_extractor_panel .sfe-review-card pre {
+  flex: 1 1 auto;
+  min-height: 260px;
+  max-height: 420px;
+  margin: 0;
+}
+
+#sage_factoid_extractor_panel .sfe-diagnostics-grid pre {
+  min-height: 160px;
+  max-height: 300px;
+}
+
+#sage_factoid_extractor_panel .sfe-nested-details {
+  margin-top: 8px;
+}
+
+#sage_factoid_extractor_panel .sfe-utility-buttons {
+  align-items: stretch;
+}
+
+#sage_factoid_extractor_panel .sfe-config-grid {
+  display: grid;
+  gap: 8px;
+}
+
+#sage_factoid_extractor_panel fieldset {
+  border: 1px solid rgba(127,127,127,0.25);
+  border-radius: 7px;
+  padding: 8px;
+  margin: 0;
+}
+
+#sage_factoid_extractor_panel fieldset legend {
+  font-weight: 600;
+  padding: 0 4px;
+}
+
+@media (max-width: 760px) {
+  #sage_factoid_extractor_panel .sfe-review-grid {
+    grid-template-columns: 1fr;
+  }
+
+  #sage_factoid_extractor_panel .sfe-topbar {
+    flex-direction: column;
+  }
+
+  #sage_factoid_extractor_panel .sfe-topchecks {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+}
