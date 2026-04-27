@@ -1,3 +1,16 @@
+# Sage Phase 1 Factoid Extractor v0.1.26
+
+## v0.1.26 changes
+
+- Fixes a second v0.1.24 modular-refactor runtime error: `canonicalKey is not defined`.
+- Moves shared helper functions `canonicalKey` and `displayLocationForObject` into `state.js` exports.
+- Imports those helpers into `reconcile.js` alongside `recentChatText`.
+- Bumps the operator/displayed extension version to `0.1.26`.
+
+## v0.1.26 reason
+
+The v0.1.24 refactor left some helper functions local to `index.js` even though `reconcile.js` also uses them during split-scene and no-op scene reconciliation. This update makes those helpers shared module exports.
+
 # Sage Phase 1 Factoid Extractor v0.1.25
 
 ## v0.1.25 changes
