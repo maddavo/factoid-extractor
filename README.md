@@ -1,3 +1,16 @@
+# Sage Phase 1 Factoid Extractor v0.1.22
+
+## v0.1.22 changes
+
+- Reworks the extension panel for operator review during formal testing.
+- Adds a compact header/status strip.
+- Keeps **Operator review** open by default with Apply/Reject buttons directly above the comparison area.
+- Shows **Next pending proposed packet changes** and **Rendered OOC packet preview** as paired review panes.
+- Moves queue/raw JSON/state into a collapsed diagnostics section.
+- Moves cleanup/export/reset controls into a collapsed utilities section.
+- Moves configuration into a collapsed, grouped settings section.
+- Retains all v0.1.21 participant/body-state scene reconciliation behaviour.
+
 # Sage Phase 1 Factoid Extractor v0.1.21
 
 ## v0.1.21 changes

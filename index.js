@@ -1,7 +1,7 @@
 // Sage Phase 1 Factoid Extractor for SillyTavern
-// v0.1.21 — participant/body-state scene reconciliation.
+// v0.1.22 — operator review UI cleanup.
 
-const EXTENSION_VERSION = '0.1.21';
+const EXTENSION_VERSION = '0.1.22';
 
 const MODULE_NAME = 'sage_phase1_factoid_extractor';
 const MODULE_TITLE = 'Sage Phase 1 Factoid Extractor';
@@ -1956,7 +1956,7 @@ ${m.lastRawExtractorText}` : 'No extractor output yet.');
         const pending = m.pendingProposals.filter(p => p.status === 'pending').length;
         const next = pendingProposalsOrdered()[0];
         const nextText = next ? ` | next pending turn: ${next.turn_count ?? '?'}` : '';
-        countEl.textContent = `Version: v${EXTENSION_VERSION} | Audit runs: ${m.auditLog.length} | pending: ${pending}${nextText} | skipped: ${m.skippedRuns || 0} | last run: ${m.lastRunAt || 'never'} | last skip: ${m.lastSkipReason || 'none'}`;
+        countEl.textContent = `v${EXTENSION_VERSION} | pending ${pending}${nextText} | runs ${m.auditLog.length} | skipped ${m.skippedRuns || 0} | last run ${m.lastRunAt || 'never'} | last skip ${m.lastSkipReason || 'none'}`;
     }
 
     if (m.lastError) updateUiStatus('bad', `Last error: ${m.lastError}`);
@@ -1986,47 +1986,103 @@ function installUi() {
     if (document.getElementById('sage_factoid_extractor_panel')) return;
     const html = `
 <div id="sage_factoid_extractor_panel" class="sfe-panel">
-  <h3>Sage Phase 1 Factoid Extractor <span class="sfe-version">v${EXTENSION_VERSION}</span></h3>
-  <div class="sfe-small">Live extraction of proposed CurrentScene and RecentEvents deltas. Review-first by default.</div>
-
-  <div class="sfe-row"><label><input id="sfe_enabled" type="checkbox"> Enabled</label><label><input id="sfe_autorun" type="checkbox"> Auto-run</label><label><input id="sfe_autoapply" type="checkbox"> Auto-apply proposed deltas</label><label><input id="sfe_debug" type="checkbox"> Debug console logging</label></div>
-  <div class="sfe-row"><label for="sfe_trigger">Trigger</label><select id="sfe_trigger"><option value="assistant">After assistant reply</option><option value="user_and_assistant">After user and assistant messages</option></select></div>
-  <div class="sfe-row"><label for="sfe_autorun_policy">Auto-run policy</label><select id="sfe_autorun_policy"><option value="periodic_or_scene_cue">Periodic or scene/event cue</option><option value="periodic_or_marker">Periodic or explicit marker only</option><option value="periodic_only">Periodic only</option><option value="always">Always run on trigger</option></select><label for="sfe_periodic_user_messages">Every N user messages</label><input id="sfe_periodic_user_messages" type="number" min="1" max="50" step="1"><label><input id="sfe_scene_cue_prefilter" type="checkbox"> Scene cue prefilter</label><label><input id="sfe_event_cue_prefilter" type="checkbox"> High-salience event cue prefilter</label><label><input id="sfe_remote_cue_prefilter" type="checkbox"> Remote/split-scene cue prefilter</label></div>
-  <div class="sfe-row"><label for="sfe_scene_marker_regex">Scene marker regex</label><input id="sfe_scene_marker_regex" type="text" spellcheck="false"></div>
-  <div class="sfe-row"><label for="sfe_endpoint">Extractor endpoint</label><input id="sfe_endpoint" type="text" spellcheck="false"></div>
-  <div class="sfe-row"><label for="sfe_model">Model</label><input id="sfe_model" type="text" spellcheck="false"></div>
-  <div class="sfe-row"><label for="sfe_apikey">API key</label><input id="sfe_apikey" type="text" spellcheck="false" placeholder="blank for LM Studio"></div>
-  <div class="sfe-row"><label for="sfe_recent_limit">Recent messages</label><input id="sfe_recent_limit" type="number" min="2" max="40" step="1"><label for="sfe_max_tokens">Max output tokens</label><input id="sfe_max_tokens" type="number" min="100" max="4000" step="50"><label><input id="sfe_json_response" type="checkbox"> Request JSON response_format</label></div>
-  <div class="sfe-row"><label><input id="sfe_strict_events" type="checkbox"> Strict RecentEvents gate</label><label for="sfe_min_event_importance">Min event importance</label><input id="sfe_min_event_importance" type="number" min="0" max="5" step="1"><label for="sfe_max_events_per_proposal">Max events/proposal</label><input id="sfe_max_events_per_proposal" type="number" min="0" max="3" step="1"></div>
-  <div class="sfe-row"><label><input id="sfe_clear_objects_on_location_change" type="checkbox"> Expire old room objects on location change</label><span class="sfe-small">Recommended on: prevents “The floor” objects from following Sage into a new room.</span></div>
-  <div class="sfe-row"><label for="sfe_surroundings_mode">Surroundings update mode</label><select id="sfe_surroundings_mode"><option value="location_only">Location/sub-location/environment only</option><option value="normal">Normal extractor output</option></select><span class="sfe-small">Default suppresses body-position, touch, intensity, mood, and decorative surroundings churn.</span></div>
-  <div class="sfe-row"><label for="sfe_object_coalescing_mode">Object coalescing mode</label><select id="sfe_object_coalescing_mode"><option value="conservative">Conservative: cash + identical generic objects</option><option value="off">Off</option></select><span class="sfe-small">Combines interchangeable same-location objects, e.g. multiple $10 payments into one cash total.</span></div>
-  <div class="sfe-row"><label for="sfe_scene_reconciliation_mode">Scene reconciliation mode</label><select id="sfe_scene_reconciliation_mode"><option value="suppress_participant_blocking">Suppress participant/body-position objects</option><option value="off">Off</option></select><span class="sfe-small">Prevents Davo/Sage/Quinn/Maya/Josy and transient blocking from being stored as nearby objects.</span></div>
-
-  <div class="sfe-row sfe-buttons">
-    <button id="sfe_run_now" class="menu_button">Run extraction now</button>
-    <button id="sfe_apply_latest" class="menu_button">Apply next pending</button>
-    <button id="sfe_reject_latest" class="menu_button">Reject next pending</button>
-    <button id="sfe_copy_summary" class="menu_button">Copy review summary</button>
-    <button id="sfe_copy_latest" class="menu_button">Copy latest JSON</button>
-    <button id="sfe_copy_packets" class="menu_button">Copy OOC packet preview</button>
-    <button id="sfe_prune_events" class="menu_button">Prune weak RecentEvents</button>
-    <button id="sfe_clear_objects" class="menu_button">Clear nearby objects</button>
-    <button id="sfe_coalesce_objects" class="menu_button">Coalesce current objects</button>
-    <button id="sfe_reconcile_scene" class="menu_button">Reconcile current scene</button>
-    <button id="sfe_export_json" class="menu_button">Export audit JSON</button>
-    <button id="sfe_export_md" class="menu_button">Export controller MD</button>
-    <button id="sfe_reset" class="menu_button">Reset chat state</button>
+  <div class="sfe-topbar">
+    <div>
+      <h3>Sage Phase 1 Factoid Extractor <span class="sfe-version">v${EXTENSION_VERSION}</span></h3>
+      <div id="sfe_counts" class="sfe-small sfe-counts"></div>
+    </div>
+    <div class="sfe-topchecks">
+      <label><input id="sfe_enabled" type="checkbox"> Enabled</label>
+      <label><input id="sfe_autorun" type="checkbox"> Auto-run</label>
+    </div>
   </div>
 
   <div id="sfe_status" class="sfe-status-warn">Idle.</div>
-  <div id="sfe_counts" class="sfe-small"></div>
 
-  <details open><summary>Next pending proposed packet changes</summary><pre id="sfe_latest_summary"></pre></details>
-  <details open><summary>Pending proposal queue</summary><pre id="sfe_pending_queue"></pre></details>
-  <details><summary>Raw selected/next extractor JSON</summary><pre id="sfe_latest_proposal"></pre></details>
-  <details><summary>Applied Phase 1 state</summary><pre id="sfe_state_preview"></pre></details>
-  <details><summary>Rendered OOC packet preview</summary><pre id="sfe_packet_preview"></pre></details>
+  <details class="sfe-section sfe-operator" open>
+    <summary>Operator review</summary>
+    <div class="sfe-actionbar">
+      <button id="sfe_run_now" class="menu_button">Run now</button>
+      <button id="sfe_apply_latest" class="menu_button sfe-primary-action">Apply next</button>
+      <button id="sfe_reject_latest" class="menu_button sfe-danger-action">Reject next</button>
+      <button id="sfe_copy_summary" class="menu_button">Copy pending</button>
+      <button id="sfe_copy_packets" class="menu_button">Copy rendered</button>
+    </div>
+    <div class="sfe-review-grid">
+      <section class="sfe-review-card">
+        <div class="sfe-card-title">Next pending proposed packet changes</div>
+        <pre id="sfe_latest_summary"></pre>
+      </section>
+      <section class="sfe-review-card">
+        <div class="sfe-card-title">Rendered OOC packet preview</div>
+        <pre id="sfe_packet_preview"></pre>
+      </section>
+    </div>
+  </details>
+
+  <details class="sfe-section">
+    <summary>Pending queue / diagnostics</summary>
+    <div class="sfe-review-grid sfe-diagnostics-grid">
+      <section class="sfe-review-card">
+        <div class="sfe-card-title">Pending proposal queue</div>
+        <pre id="sfe_pending_queue"></pre>
+      </section>
+      <section class="sfe-review-card">
+        <div class="sfe-card-title">Raw selected/next extractor JSON</div>
+        <pre id="sfe_latest_proposal"></pre>
+      </section>
+    </div>
+    <details class="sfe-nested-details"><summary>Applied Phase 1 state</summary><pre id="sfe_state_preview"></pre></details>
+  </details>
+
+  <details class="sfe-section">
+    <summary>Utilities / maintenance</summary>
+    <div class="sfe-row sfe-buttons sfe-utility-buttons">
+      <button id="sfe_prune_events" class="menu_button">Prune weak RecentEvents</button>
+      <button id="sfe_clear_objects" class="menu_button">Clear nearby objects</button>
+      <button id="sfe_coalesce_objects" class="menu_button">Coalesce current objects</button>
+      <button id="sfe_reconcile_scene" class="menu_button">Reconcile current scene</button>
+      <button id="sfe_copy_latest" class="menu_button">Copy latest JSON</button>
+      <button id="sfe_export_json" class="menu_button">Export audit JSON</button>
+      <button id="sfe_export_md" class="menu_button">Export controller MD</button>
+      <button id="sfe_reset" class="menu_button">Reset chat state</button>
+    </div>
+  </details>
+
+  <details class="sfe-section sfe-config-section">
+    <summary>Configuration</summary>
+    <div class="sfe-config-grid">
+      <fieldset><legend>General</legend>
+        <div class="sfe-row"><label><input id="sfe_autoapply" type="checkbox"> Auto-apply proposed deltas</label><label><input id="sfe_debug" type="checkbox"> Debug console logging</label></div>
+        <div class="sfe-row"><label for="sfe_trigger">Trigger</label><select id="sfe_trigger"><option value="assistant">After assistant reply</option><option value="user_and_assistant">After user and assistant messages</option></select></div>
+        <div class="sfe-row"><label for="sfe_autorun_policy">Auto-run policy</label><select id="sfe_autorun_policy"><option value="periodic_or_scene_cue">Periodic or scene/event cue</option><option value="periodic_or_marker">Periodic or explicit marker only</option><option value="periodic_only">Periodic only</option><option value="always">Always run on trigger</option></select></div>
+        <div class="sfe-row"><label for="sfe_periodic_user_messages">Every N user messages</label><input id="sfe_periodic_user_messages" type="number" min="1" max="50" step="1"></div>
+      </fieldset>
+
+      <fieldset><legend>Extractor</legend>
+        <div class="sfe-row"><label for="sfe_endpoint">Endpoint</label><input id="sfe_endpoint" type="text" spellcheck="false"></div>
+        <div class="sfe-row"><label for="sfe_model">Model</label><input id="sfe_model" type="text" spellcheck="false"></div>
+        <div class="sfe-row"><label for="sfe_apikey">API key</label><input id="sfe_apikey" type="text" spellcheck="false" placeholder="blank for LM Studio"></div>
+        <div class="sfe-row"><label for="sfe_recent_limit">Recent messages</label><input id="sfe_recent_limit" type="number" min="2" max="40" step="1"><label for="sfe_max_tokens">Max output tokens</label><input id="sfe_max_tokens" type="number" min="100" max="4000" step="50"></div>
+        <div class="sfe-row"><label><input id="sfe_json_response" type="checkbox"> Request JSON response_format</label></div>
+      </fieldset>
+
+      <fieldset><legend>Event gating</legend>
+        <div class="sfe-row"><label><input id="sfe_strict_events" type="checkbox"> Strict RecentEvents gate</label></div>
+        <div class="sfe-row"><label for="sfe_min_event_importance">Min event importance</label><input id="sfe_min_event_importance" type="number" min="0" max="5" step="1"><label for="sfe_max_events_per_proposal">Max events/proposal</label><input id="sfe_max_events_per_proposal" type="number" min="0" max="3" step="1"></div>
+        <div class="sfe-row"><label><input id="sfe_event_cue_prefilter" type="checkbox"> High-salience event cue prefilter</label></div>
+      </fieldset>
+
+      <fieldset><legend>Scene handling</legend>
+        <div class="sfe-row"><label><input id="sfe_scene_cue_prefilter" type="checkbox"> Scene cue prefilter</label><label><input id="sfe_remote_cue_prefilter" type="checkbox"> Remote/split-scene cue prefilter</label></div>
+        <div class="sfe-row"><label for="sfe_scene_marker_regex">Scene marker regex</label><input id="sfe_scene_marker_regex" type="text" spellcheck="false"></div>
+        <div class="sfe-row"><label><input id="sfe_clear_objects_on_location_change" type="checkbox"> Expire old room objects on location change</label></div>
+        <div class="sfe-row"><label for="sfe_surroundings_mode">Surroundings update mode</label><select id="sfe_surroundings_mode"><option value="location_only">Location/sub-location/environment only</option><option value="normal">Normal extractor output</option></select></div>
+        <div class="sfe-row"><label for="sfe_object_coalescing_mode">Object coalescing mode</label><select id="sfe_object_coalescing_mode"><option value="conservative">Conservative: cash + identical generic objects</option><option value="off">Off</option></select></div>
+        <div class="sfe-row"><label for="sfe_scene_reconciliation_mode">Scene reconciliation mode</label><select id="sfe_scene_reconciliation_mode"><option value="suppress_participant_blocking">Suppress participant/body-position objects</option><option value="off">Off</option></select></div>
+      </fieldset>
+    </div>
+  </details>
 </div>`;
 
     const host = document.querySelector('#extensions_settings') || document.querySelector('#extensions_settings2') || document.body;
