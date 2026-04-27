@@ -1,7 +1,7 @@
 // Scene reconciliation, object coalescing, proposal normalization, and RecentEvents gates.
 
 import { EMPTY_SCENE } from './constants.js';
-import { metadata, settings, sanitizeText, objectRemoveName, addUnique, removeByCaseInsensitive, sameText, recentChatText } from './state.js';
+import { metadata, settings, sanitizeText, objectRemoveName, addUnique, removeByCaseInsensitive, sameText, recentChatText, canonicalKey, displayLocationForObject } from './state.js';
 
 const KNOWN_CHARACTER_ALIASES = Object.freeze([
     'davo',

@@ -159,3 +159,23 @@ export function sameText(a, b) {
     return String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
 }
 
+
+export function canonicalKey(value) {
+    return String(value || '').trim().toLowerCase();
+}
+
+export function displayLocationForObject(location, sceneRef = '') {
+    const loc = sanitizeText(location);
+    const scene = sanitizeText(sceneRef || metadata().currentScene?.location_ref);
+    if (!loc) return '';
+    const text = loc.trim();
+    const hasExplicitPlace = /\b(cafeteria|dorm|bathroom|hallway|kitchen|bedroom|office|study|room|entrance)\b/i.test(text);
+    const genericLocal = /^(\s*the\s+)?(floor|ground|desk|table|chair|bed|door|doorway|door frame|counter|bench)$/i.test(text)
+        || /^(on|under|beside|near|next to|against|by)\b/i.test(text)
+        || (/\b(floor|desk|table|chair|bed|door frame|counter|bench)\b/i.test(text) && !hasExplicitPlace);
+    if (scene && genericLocal && !text.toLowerCase().includes(scene.toLowerCase())) {
+        return `${scene} — ${text}`;
+    }
+    return text;
+}
+
