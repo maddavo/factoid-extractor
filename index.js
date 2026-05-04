@@ -1,12 +1,297 @@
 // Sage Phase 1 Factoid Extractor for SillyTavern
-// v0.1.24 — split source modules.
+// v0.1.22 — operator review UI cleanup.
 
-import { EXTENSION_VERSION, MODULE_NAME, MODULE_TITLE, DEFAULT_SETTINGS, EMPTY_SCENE } from './constants.js';
-import { EXTRACTION_SYSTEM_PROMPT } from './prompt.js';
-import { buildLmStudioJsonSchemaResponseFormat } from './schema.js';
-import { parseJsonContent } from './json-repair.js';
-import { ctx, settings, saveSettings, defaultMetadata, metadata, saveMetadataNow, structuredCloneSafe, logDebug, toastInfo, toastWarn, toastError, sanitizeText, objectRemoveName, getRecentTurns, chatSignature, userMessageCount, recentChatText, addUnique, removeByCaseInsensitive, sameText } from './state.js';
-import { coalesceNearbyObjects, coalesceSceneUpdateObjects, coalesceRecentEvents, normalizeProposal, isSplitSceneState, filterNoOpSceneDelta, eventGateReason, eventDuplicatesSceneDelta, eventRenderable, hasSubstantiveDelta, reconcileSceneObjectsForStorage } from './reconcile.js';
+const EXTENSION_VERSION = '0.1.22';
+
+const MODULE_NAME = 'sage_phase1_factoid_extractor';
+const MODULE_TITLE = 'Sage Phase 1 Factoid Extractor';
+
+const DEFAULT_SETTINGS = Object.freeze({
+    enabled: false,
+    autoRun: true,
+    trigger: 'assistant', // assistant | user_and_assistant
+    autoRunPolicy: 'periodic_or_scene_cue', // always | periodic_only | periodic_or_marker | periodic_or_scene_cue
+    periodicUserMessages: 10,
+    sceneCuePrefilter: true,
+    highSalienceEventCuePrefilter: true,
+    remoteCommunicationCuePrefilter: true,
+    sceneMarkerRegex: '<!--SAP_SCENE_CHANGE-->|<sap_scene_change\\s*/?>|\\[\\[SAP_SCENE_CHANGE\\]\\]',
+    endpoint: '/proxy/http://127.0.0.1:1234/v1/chat/completions',
+    model: 'local-model',
+    apiKey: '',
+    temperature: 0,
+    maxTokens: 1200,
+    recentMessageLimit: 10,
+    debounceMs: 1500,
+    responseFormatJson: false,
+    autoApply: false,
+    keepResolvedEvents: false,
+    unresolvedEventLimit: 6,
+    strictRecentEvents: true,
+    minEventImportance: 4,
+    maxEventsPerProposal: 1,
+    clearRoomObjectsOnLocationChange: true,
+    surroundingsUpdateMode: 'location_only', // location_only | normal
+    objectCoalescingMode: 'conservative', // conservative | off
+    sceneReconciliationMode: 'suppress_participant_blocking', // suppress_participant_blocking | off
+    debug: false
+});
+
+const EMPTY_SCENE = Object.freeze({
+    location_ref: '',
+    present_entities: [],
+    nearby_objects: [],
+    surroundings_summary: '',
+    last_updated_turn: 0
+});
+
+const EXTRACTION_SYSTEM_PROMPT = `You are a continuity fact extractor for a SillyTavern roleplay chat.
+You are not Sage. Do not roleplay. Do not continue the scene.
+Your only job is to propose sparse Phase 1 state deltas for a continuity layer.
+
+PHASE 1 STATE ONLY:
+1. CurrentScene:
+- current location
+- currently present people/entities
+- nearby practical objects
+- object locations
+- do not store participants/characters as nearby_objects; participants belong in present_entities
+- one short surroundings summary only if it materially anchors the scene
+- surroundings_summary should be stable environmental context, not body/pose/blocking description
+- split-location remote communication is allowed in CurrentScene using schema-pure text fields
+
+2. RecentEvents:
+- only rare, high-salience facts Sage must remember in the next several turns
+- normally use RecentEvents only when there is a clear unresolved consequence not already captured by CurrentScene
+- exception: major relationship/status changes are valid RecentEvents even if they are not an unresolved task, because Phase 1 has no RelationshipState object yet
+- examples that usually qualify: object broken and still matters, important item lost and not found, explicit promise/request/task/deadline, urgent interruption, a plan changed with unresolved next action, factual reminder that must affect the next response, explicit girlfriend/boyfriend/partner/relationship status change, explicit persistent relationship/role designation such as master/mistress/dominant/submissive/owner if the chat clearly treats it as an ongoing status
+- examples that usually do NOT qualify: ordinary dialogue progress, greetings, banter, flirtation, emotional colour, a normal question/answer, a minor observation, scene transition already stored in CurrentScene, object placement/movement already stored in CurrentScene, person entered/left already reflected in present_entities, completed handover with no unresolved consequence
+
+STRICT RULES:
+- Prefer no update over guessing.
+- Extract only explicit or strongly established facts.
+- Do not infer hidden motives.
+- Do not invent.
+- Preserve actor/object names.
+- For nearby_objects_remove, output only the object name as a string, never an object.
+- Do not use nearby_objects to store participant body position, sexual blocking, sitting/standing/leaning/straddling/contact, or who is next to whom.
+- If Davo, Sage, Quinn, Maya, Josy, or another active character is physically present, store them in present_entities, not as an object on the couch/bed/floor.
+- Clothing/items may be stored only when they have a stable object location, e.g. "Davo's pants: floor near the couch". Do not store transient contact such as "Sage's bodysuit: being touched by Davo".
+- Avoid pronouns in stored facts.
+- Do not store mood as a scene fact.
+- Do not update surroundings_summary for sexual/body-position/blocking changes, touch/grab/kiss/intensity/mood/decorative detail, or ordinary physical interaction.
+- Only update surroundings_summary when location_ref changes, sub-location changes, or a stable practical environmental anchor changes, such as door locked/open/closed, lights on/off, shower running, bed broken, room flooded, fire/smoke/alarm, window open/closed, etc.
+- Do not store generic flirt lines, banter, emotional colour, ordinary replies, questions, acknowledgements, or decorative ambience as RecentEvents.
+- If one character asks for a committed relationship and the other explicitly accepts, store one RecentEvent with importance_score 5, e.g. "Sage accepted Davo's request to be her boyfriend/girlfriend/partner; their relationship status changed."
+- If a character explicitly designates a durable relationship/role/status label, store one RecentEvent with importance_score 5, e.g. "Sage explicitly designated Davo as her master; their relationship/role status changed." Treat it as durable until later explicit text countermands/cancels it. Do not store it if it is clearly temporary, joking, hypothetical, or only body-position/scene flavour.
+- Do not turn every response into a RecentEvent. RecentEvents should be rare.
+- Do not duplicate CurrentScene in RecentEvents. If the scene/object state already captures the change, leave recent_event_updates empty unless there is a still-unresolved practical consequence.
+- Do not output no-op scene updates. If an object is already recorded at the same location, do not add/update it again.
+- Do not output both add/update and remove for the same object in one proposal. If the object is still present, do not remove it.
+- A RecentEvent must pass this gate: would omitting it likely cause Sage to contradict an unresolved task, obligation, broken/lost item, urgent interruption, changed plan, or major relationship/status change, or durable relationship/role designation within the next 5-10 turns? If no, do not extract it.
+- For RecentEvents, importance_score uses 0-5. Output only importance_score 4 or 5 events.
+- Output at most one new RecentEvent per extraction pass. If several candidates exist, keep only the most practically urgent one.
+- Do not treat decorative assistant narration as authoritative when it invents unsupported details.
+- If assistant narration changes a practical state, include it only when the fact is clear and consistent with prior established context.
+- If characters are physically separated but still interacting by text/phone/call/video call, do NOT mark them as physically co-present. This is a split-location remote communication scene.
+- For split-location remote communication, use schema-pure fields: set location_ref to a concise split scene such as "Split scene: Davo in HOTs kitchen; Sage in Exam Hall"; remove unqualified co-present entities such as "Davo" and "Sage Morgan-Burke" if they were previously present together; add qualified entities such as "Davo — local, HOTs kitchen" and "Sage Morgan-Burke — remote, Exam Hall, texting by phone"; put the communication mode in surroundings_summary, e.g. "Davo and Sage are communicating by text while physically separated."
+- For split-location scenes, object locations must include which physical side they belong to, e.g. "HOTs kitchen counter" or "Exam Hall desk". Do not use generic locations like "the floor" without a side/location.
+- If the current location/room changes, remove old room-local nearby_objects unless the object is explicitly carried into the new scene.
+- Prefer latest explicit physical state over older conflicting physical/blocking facts. Do not preserve stale sexual/body-position facts from earlier in the scene.
+- Coalesce interchangeable objects when they share the same current location/container. Prefer "$40 cash in Davo's pocket" over four separate "$10 cash from X" objects. Do not coalesce unique/personal/named objects such as phones, keys, notes, letters, weapons, evidence, gifts, clothing, bags, or identity-specific items.
+- If new explicit text contradicts old state, prefer the latest explicit fact and include a rejected_candidate or uncertainty note.
+- Cap output to the most important Phase 1 facts. Sparse is better than complete.
+- Social shock, sexual escalation, and scandal/colour are not RecentEvents unless they create a durable relationship/status/protocol fact or an unresolved practical consequence. If only ordinary conversation happened, set recent_event_updates to [] and explain rejected candidates if useful.
+- Output valid JSON only. No Markdown. No prose outside JSON.
+
+OUTPUT SHAPE:
+{
+  "scene_update": {
+    "location_ref": null,
+    "present_entities_add": [],
+    "present_entities_remove": [],
+    "nearby_objects_add_or_update": [],
+    "nearby_objects_remove": [],
+    "surroundings_summary": null
+  },
+  "recent_event_updates": [
+    {
+      "summary": "",
+      "causal_result": "",
+      "resolved": false,
+      "importance_score": 0,
+      "evidence": ""
+    }
+  ],
+  "resolved_event_updates": [
+    {
+      "matches_existing_event": "",
+      "resolution": "",
+      "evidence": ""
+    }
+  ],
+  "rejected_candidates": [
+    {
+      "candidate": "",
+      "reason": ""
+    }
+  ],
+  "no_update_reason": ""
+}
+
+Use null or empty arrays for no change.
+For nearby_objects_add_or_update, use objects like {"name":"Davo's mug","location":"Sage's study desk","evidence":"Turn 14: ..."}.
+For RecentEvents, causal_result is mandatory: describe the unresolved practical consequence. If no unresolved practical consequence exists, do not create the event.
+Evidence must point to source turn numbers or short quotes from the chat text.
+
+CRITICAL JSON RELIABILITY RULES:
+- Always include all five top-level keys: scene_update, recent_event_updates, resolved_event_updates, rejected_candidates, no_update_reason.
+- If there are no events, still output "recent_event_updates": [] and "resolved_event_updates": [].
+- End with a complete closing brace.
+- Do not leave a dangling comma after scene_update.`;
+
+function ctx() {
+    return globalThis.SillyTavern?.getContext?.() || {};
+}
+
+function settings() {
+    const context = ctx();
+    context.extensionSettings = context.extensionSettings || {};
+    context.extensionSettings[MODULE_NAME] = context.extensionSettings[MODULE_NAME] || {};
+    const s = context.extensionSettings[MODULE_NAME];
+    for (const [k, v] of Object.entries(DEFAULT_SETTINGS)) {
+        if (s[k] === undefined) s[k] = v;
+    }
+    return s;
+}
+
+function saveSettings() {
+    const context = ctx();
+    context.saveSettingsDebounced?.();
+}
+
+function defaultMetadata() {
+    return {
+        version: EXTENSION_VERSION,
+        currentScene: structuredCloneSafe(EMPTY_SCENE),
+        recentEvents: [],
+        pendingProposals: [],
+        auditLog: [],
+        lastProcessedSignature: '',
+        lastExtractionUserMessageCount: 0,
+        skippedRuns: 0,
+        lastSkipReason: '',
+        lastRunAt: null,
+        lastError: '',
+        lastRawExtractorText: ''
+    };
+}
+
+function metadata() {
+    const context = ctx();
+    context.chatMetadata = context.chatMetadata || {};
+    context.chatMetadata[MODULE_NAME] = context.chatMetadata[MODULE_NAME] || defaultMetadata();
+    const m = context.chatMetadata[MODULE_NAME];
+    if (!m.currentScene) m.currentScene = structuredCloneSafe(EMPTY_SCENE);
+    if (!Array.isArray(m.recentEvents)) m.recentEvents = [];
+    if (!Array.isArray(m.pendingProposals)) m.pendingProposals = [];
+    if (!Array.isArray(m.auditLog)) m.auditLog = [];
+    if (!m.version) m.version = EXTENSION_VERSION;
+    if (m.lastExtractionUserMessageCount === undefined) m.lastExtractionUserMessageCount = 0;
+    if (m.skippedRuns === undefined) m.skippedRuns = 0;
+    if (m.lastSkipReason === undefined) m.lastSkipReason = '';
+    return m;
+}
+
+async function saveMetadataNow() {
+    const context = ctx();
+    if (typeof context.saveMetadata === 'function') {
+        await context.saveMetadata();
+    } else if (typeof context.saveMetadataDebounced === 'function') {
+        context.saveMetadataDebounced();
+    }
+}
+
+function structuredCloneSafe(obj) {
+    try { return structuredClone(obj); } catch { return JSON.parse(JSON.stringify(obj)); }
+}
+
+function logDebug(...args) {
+    if (settings().debug) console.debug(`[${MODULE_TITLE}]`, ...args);
+}
+
+function toastInfo(message) { globalThis.toastr?.info?.(message, MODULE_TITLE); }
+function toastWarn(message) { globalThis.toastr?.warning?.(message, MODULE_TITLE); }
+function toastError(message) { globalThis.toastr?.error?.(message, MODULE_TITLE); }
+
+function sanitizeText(text) {
+    if (text === null || text === undefined) return '';
+    if (typeof text === 'object') return sanitizeObjectText(text);
+    return String(text)
+        .replace(/<[^>]*>/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function sanitizeObjectText(value) {
+    if (!value || typeof value !== 'object') return '';
+    const candidate = value.name ?? value.object ?? value.object_name ?? value.item ?? value.label ?? value.summary ?? value.text ?? '';
+    if (candidate) return sanitizeText(candidate);
+    try { return JSON.stringify(value); } catch { return ''; }
+}
+
+function objectRemoveName(value) {
+    if (typeof value === 'string') return sanitizeText(value);
+    if (!value || typeof value !== 'object') return '';
+    return sanitizeText(value.name ?? value.object ?? value.object_name ?? value.item ?? value.label ?? value.target ?? value.current_name ?? '');
+}
+
+function roleOfMessage(message) {
+    if (message?.is_system) return 'system';
+    if (message?.is_user) return 'user';
+    if (message?.extra?.type === 'system') return 'system';
+    return 'assistant';
+}
+
+function speakerOfMessage(message, fallbackRole) {
+    return sanitizeText(message?.name || message?.original_avatar || fallbackRole || 'unknown');
+}
+
+function getRecentTurns(limit) {
+    const chat = ctx().chat || [];
+    const start = Math.max(0, chat.length - Number(limit || 10));
+    return chat.slice(start).map((message, offset) => {
+        const absoluteTurn = start + offset;
+        const role = roleOfMessage(message);
+        return {
+            turn: absoluteTurn,
+            role,
+            speaker: speakerOfMessage(message, role),
+            text: sanitizeText(message?.mes)
+        };
+    }).filter(t => t.text.length > 0);
+}
+
+function chatSignature() {
+    const chat = ctx().chat || [];
+    const last = chat[chat.length - 1];
+    const prev = chat[chat.length - 2];
+    return JSON.stringify({
+        length: chat.length,
+        last: sanitizeText(last?.mes).slice(0, 500),
+        prev: sanitizeText(prev?.mes).slice(0, 200)
+    });
+}
+
+function userMessageCount() {
+    const chat = ctx().chat || [];
+    return chat.filter(message => roleOfMessage(message) === 'user').length;
+}
+
+function recentChatText(limit = 6) {
+    const chat = ctx().chat || [];
+    return chat.slice(Math.max(0, chat.length - limit)).map(message => sanitizeText(message?.mes)).join('\n');
+}
 
 function sceneMarkerDetected() {
     const pattern = settings().sceneMarkerRegex || DEFAULT_SETTINGS.sceneMarkerRegex;
@@ -93,81 +378,93 @@ function autoRunGate(reason) {
     return { run: false, reason: 'no scene/event/remote cue or marker and ' + intervalNotReached };
 }
 
-function truncateExtractorText(text, maxChars) {
-    const value = sanitizeText(text);
-    const limit = Math.max(120, Number(maxChars || 900));
-    if (value.length <= limit) return value;
-    return value.slice(0, limit - 24).trimEnd() + ' …[truncated]';
-}
-
-function compactRecentEventForPayload(event) {
-    return {
-        summary: truncateExtractorText(event?.summary, 260),
-        causal_result: truncateExtractorText(event?.causal_result, 260),
-        resolved: Boolean(event?.resolved),
-        importance_score: Number(event?.importance_score || 0),
-        evidence: truncateExtractorText(event?.evidence, 180)
-    };
-}
-
-function buildExtractorPayloadObject(options = {}) {
+function buildExtractorUserPayload() {
     const s = settings();
     const m = metadata();
-    const compact = Boolean(options.compact);
-    const maxTurnChars = compact
-        ? Math.max(240, Math.floor(Number(s.maxInputCharsPerTurn || 900) / 2))
-        : Math.max(240, Number(s.maxInputCharsPerTurn || 900));
-    const recentLimit = compact
-        ? Math.max(2, Math.min(Number(s.recentMessageLimit || 6), 3))
-        : Number(s.recentMessageLimit || 6);
-    const maxPreviousEvents = compact
-        ? Math.max(1, Math.min(Number(s.maxPreviousRecentEventsForPayload || 4), 2))
-        : Math.max(0, Number(s.maxPreviousRecentEventsForPayload || 4));
-
-    const previousEvents = coalesceRecentEvents(m.recentEvents || [])
-        .filter(eventRenderable)
-        .slice(0, maxPreviousEvents)
-        .map(compactRecentEventForPayload);
-
-    const recentTurns = getRecentTurns(recentLimit).map(turn => ({
-        ...turn,
-        text: truncateExtractorText(turn.text, maxTurnChars)
-    }));
-
-    return {
-        task: compact
-            ? 'Propose sparse Phase 1 continuity delta. Compact retry after context overflow.'
-            : 'Propose Phase 1 continuity state delta from recent SillyTavern chat turns.',
+    return JSON.stringify({
+        task: 'Propose Phase 1 continuity state delta from recent SillyTavern chat turns.',
         previous_CurrentScene: m.currentScene,
-        previous_RecentEvents: previousEvents,
-        recent_chat_turns: recentTurns
+        previous_RecentEvents: m.recentEvents,
+        recent_chat_turns: getRecentTurns(s.recentMessageLimit)
+    }, null, 2);
+}
+
+function buildLmStudioJsonSchemaResponseFormat() {
+    const stringOrNull = { anyOf: [{ type: 'string' }, { type: 'null' }] };
+    const stringArray = { type: 'array', items: { type: 'string' } };
+    return {
+        type: 'json_schema',
+        json_schema: {
+            name: 'sage_phase1_factoid_delta',
+            schema: {
+                type: 'object',
+                properties: {
+                    scene_update: {
+                        type: 'object',
+                        properties: {
+                            location_ref: stringOrNull,
+                            present_entities_add: stringArray,
+                            present_entities_remove: stringArray,
+                            nearby_objects_add_or_update: {
+                                type: 'array',
+                                items: {
+                                    type: 'object',
+                                    properties: {
+                                        name: { type: 'string' },
+                                        location: { type: 'string' },
+                                        evidence: { type: 'string' }
+                                    }
+                                }
+                            },
+                            nearby_objects_remove: stringArray,
+                            surroundings_summary: stringOrNull
+                        },
+                        required: ['location_ref', 'present_entities_add', 'present_entities_remove', 'nearby_objects_add_or_update', 'nearby_objects_remove', 'surroundings_summary']
+                    },
+                    recent_event_updates: {
+                        type: 'array',
+                        items: {
+                            type: 'object',
+                            properties: {
+                                summary: { type: 'string' },
+                                causal_result: { type: 'string' },
+                                resolved: { type: 'boolean' },
+                                importance_score: { type: 'number' },
+                                evidence: { type: 'string' }
+                            },
+                            required: ['summary', 'causal_result', 'resolved', 'importance_score', 'evidence']
+                        }
+                    },
+                    resolved_event_updates: {
+                        type: 'array',
+                        items: {
+                            type: 'object',
+                            properties: {
+                                matches_existing_event: { type: 'string' },
+                                resolution: { type: 'string' },
+                                evidence: { type: 'string' }
+                            },
+                            required: ['matches_existing_event', 'resolution', 'evidence']
+                        }
+                    },
+                    rejected_candidates: {
+                        type: 'array',
+                        items: {
+                            type: 'object',
+                            properties: {
+                                candidate: { type: 'string' },
+                                reason: { type: 'string' }
+                            },
+                            required: ['candidate', 'reason']
+                        }
+                    },
+                    no_update_reason: { type: 'string' }
+                },
+                required: ['scene_update', 'recent_event_updates', 'resolved_event_updates', 'rejected_candidates', 'no_update_reason']
+            }
+        }
     };
 }
-
-function buildExtractorUserPayload(options = {}) {
-    const s = settings();
-    const compact = Boolean(options.compact);
-    const maxPayloadChars = Math.max(4000, Number(s.maxExtractorPayloadChars || 14000));
-    const payloadObject = buildExtractorPayloadObject(options);
-    let payload = JSON.stringify(payloadObject, null, 2);
-
-    while (payload.length > maxPayloadChars && payloadObject.recent_chat_turns.length > 2) {
-        payloadObject.recent_chat_turns.shift();
-        payload = JSON.stringify(payloadObject, null, 2);
-    }
-
-    if (payload.length > maxPayloadChars && !compact) {
-        return buildExtractorUserPayload({ compact: true });
-    }
-
-    metadata().lastExtractorPayloadChars = payload.length;
-    return payload;
-}
-
-function isContextExceededError(error) {
-    return /context size|context length|maximum context|too many tokens|prompt is too long|exceeded/i.test(String(error?.message || error || ''));
-}
-
 
 let lastRawExtractorContent = "";
 
@@ -209,12 +506,790 @@ async function callExtractor(promptPayload) {
     return parseJsonContent(content);
 }
 
+function parseJsonContent(content) {
+    let text = stripJsonFences(String(content || '').trim());
+    const candidates = [];
+    if (text) candidates.push(text);
 
+    const first = text.indexOf('{');
+    const last = text.lastIndexOf('}');
+    if (first >= 0 && last > first) candidates.push(text.slice(first, last + 1));
+
+    const errors = [];
+    for (const candidate of candidates) {
+        try { return JSON.parse(candidate); } catch (error) { errors.push(error?.message || String(error)); }
+        const repaired = repairNearJson(candidate);
+        if (repaired !== candidate) {
+            try { return JSON.parse(repaired); } catch (error) { errors.push(error?.message || String(error)); }
+        }
+        const completed = completeTruncatedRootJson(repaired);
+        if (completed !== repaired) {
+            try { return JSON.parse(completed); } catch (error) { errors.push(error?.message || String(error)); }
+        }
+    }
+
+    const salvaged = salvagePartialProposal(text);
+    if (salvaged) return salvaged;
+
+    const detail = errors.length ? ` Parser details: ${errors[errors.length - 1]}` : '';
+    throw new Error(`Could not parse extractor JSON.${detail} Raw: ${text.slice(0, 1000)}`);
+}
+
+function stripJsonFences(text) {
+    return String(text || '')
+        .replace(/^\s*```(?:json)?\s*/i, '')
+        .replace(/\s*```\s*$/i, '')
+        .trim();
+}
+
+function repairNearJson(text) {
+    let s = stripJsonFences(text);
+    s = s.replace(/^\uFEFF/, '');
+    // Remove common JavaScript-style comments outside strict JSON. This is intentionally simple and only used after strict parse fails.
+    s = s.replace(/\/\*[\s\S]*?\*\//g, '');
+    s = s.replace(/(^|\s)\/\/.*$/gm, '$1');
+    // LM Studio/local models often emit trailing commas, which cause: "Expected double-quoted property name".
+    s = s.replace(/,\s*([}\]])/g, '$1');
+    // Tolerate accidental doubled colons after a quoted key, e.g. "name":: "Special Punch".
+    s = s.replace(/("[A-Za-z_][A-Za-z0-9_\-]*")\s*::\s*/g, '$1: ');
+    // Tolerate Markdown-emphasised keys from local models, e.g. *importance_score*: 4 or **key**: value.
+    s = s.replace(/([{,]\s*)\*\*([A-Za-z_][A-Za-z0-9_\-]*)\*\*\s*:/g, '$1\"$2\":');
+    s = s.replace(/([{,]\s*)\*([A-Za-z_][A-Za-z0-9_\-]*)\*\s*:/g, '$1\"$2\":');
+    s = s.replace(/([{,]\s*)\"\*\*?([A-Za-z_][A-Za-z0-9_\-]*)\*?\*\"\s*:/g, '$1\"$2\":');
+    // Tolerate a dangling comma at EOF from incomplete top-level output.
+    s = s.replace(/,\s*$/g, '');
+    // Tolerate bare object keys from near-JSON, e.g. {scene_update: {...}}.
+    s = s.replace(/([{,]\s*)([A-Za-z_][A-Za-z0-9_\-]*)\s*:/g, '$1"$2":');
+    // Tolerate Python-ish constants occasionally emitted by local models.
+    s = s.replace(/:\s*None\b/g, ': null').replace(/:\s*True\b/g, ': true').replace(/:\s*False\b/g, ': false');
+    return s.trim();
+}
+
+function completeTruncatedRootJson(text) {
+    let s = stripJsonFences(text || '').trim();
+    if (!s.startsWith('{')) return s;
+    // If the model emitted only {"scene_update": {...}, add the missing empty top-level fields.
+    if (/"scene_update"\s*:/.test(s) && !/"recent_event_updates"\s*:/.test(s)) {
+        s = s.replace(/,\s*$/g, '');
+        s += ',"recent_event_updates":[],"resolved_event_updates":[],"rejected_candidates":[],"no_update_reason":""}';
+        return repairNearJson(s);
+    }
+    return s;
+}
+
+function salvagePartialProposal(text) {
+    const scene = extractJsonValueForKey(text, 'scene_update');
+    if (!scene) return null;
+    let sceneObj = null;
+    try { sceneObj = JSON.parse(repairNearJson(scene)); } catch { return null; }
+    return {
+        scene_update: sceneObj,
+        recent_event_updates: [],
+        resolved_event_updates: [],
+        rejected_candidates: [
+            {
+                candidate: 'Extractor returned incomplete top-level JSON after scene_update.',
+                reason: 'Recovered complete scene_update and treated missing RecentEvents fields as empty.'
+            }
+        ],
+        no_update_reason: ''
+    };
+}
+
+function extractJsonValueForKey(text, key) {
+    const src = repairNearJson(text || '');
+    const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp('"' + escapedKey + '"\\s*:\\s*');
+    const m = re.exec(src);
+    if (!m) return null;
+    let i = m.index + m[0].length;
+    while (i < src.length && /\s/.test(src[i])) i++;
+    const open = src[i];
+    const close = open === '{' ? '}' : open === '[' ? ']' : null;
+    if (!close) return null;
+    let depth = 0;
+    let inStr = false;
+    let esc = false;
+    for (let j = i; j < src.length; j++) {
+        const ch = src[j];
+        if (inStr) {
+            if (esc) esc = false;
+            else if (ch === '\\') esc = true;
+            else if (ch === '"') inStr = false;
+            continue;
+        }
+        if (ch === '"') { inStr = true; continue; }
+        if (ch === open) depth++;
+        else if (ch === close) {
+            depth--;
+            if (depth === 0) return src.slice(i, j + 1);
+        }
+    }
+    return null;
+}
+
+
+const KNOWN_CHARACTER_ALIASES = Object.freeze([
+    'davo',
+    'sage',
+    'sage morgan-burke',
+    'quinn',
+    'maya',
+    'maya bailey',
+    'josy',
+    'josy taylor',
+    'jill',
+    'bella',
+    'isabella',
+    'zoey',
+    'riona',
+    'camila',
+    'lily',
+    'nicole',
+    'sarah',
+    'melanie',
+    'heather'
+]);
+
+function sceneReconciliationEnabled() {
+    return (settings().sceneReconciliationMode || 'suppress_participant_blocking') !== 'off';
+}
+
+function stripEntityQualifier(value) {
+    return sanitizeText(value)
+        .replace(/\s+—.*$/g, '')
+        .replace(/\s+-\s+(?:local|remote|present|texting|phone).*$/i, '')
+        .trim();
+}
+
+function canonicalEntityAlias(value) {
+    return stripEntityQualifier(value)
+        .toLowerCase()
+        .replace(/[’']/g, '')
+        .replace(/[^a-z0-9\s-]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function addEntityAliases(set, value) {
+    const full = canonicalEntityAlias(value);
+    if (!full) return;
+    set.add(full);
+    const first = full.split(/\s+/)[0];
+    if (first) set.add(first);
+}
+
+function knownEntityAliasSet(delta = null) {
+    const aliases = new Set(KNOWN_CHARACTER_ALIASES);
+    const current = metadata().currentScene || EMPTY_SCENE;
+    for (const ent of current.present_entities || []) addEntityAliases(aliases, ent);
+    const su = delta?.scene_update || {};
+    for (const ent of su.present_entities_add || []) addEntityAliases(aliases, ent);
+    for (const ent of su.present_entities_remove || []) addEntityAliases(aliases, ent);
+    return aliases;
+}
+
+function isParticipantObjectName(name, delta = null) {
+    const full = canonicalEntityAlias(name);
+    if (!full) return false;
+    const aliases = knownEntityAliasSet(delta);
+    return aliases.has(full);
+}
+
+function isBodyPartOrTransientContactObjectName(name) {
+    const t = sanitizeText(name).toLowerCase();
+    if (!t) return false;
+    const possessive = /(?:davo|sage|quinn|maya|josy|jill|bella|zoey|riona|camila|lily|nicole|sarah|melanie|heather|his|her|their)[’']?s?\s+/i.test(t);
+    const bodyPart = /\b(waist|hips?|hip|chest|thighs?|legs?|arms?|hands?|fingers?|mouth|lips?|neck|shoulders?|back|body|bodies|skin|hair|face|ass|butt|crotch|cock|pussy|breasts?|nipples?)\b/i.test(t);
+    return possessive && bodyPart;
+}
+
+function isTransientParticipantLocation(location) {
+    const t = sanitizeText(location).toLowerCase();
+    if (!t) return false;
+    return /\b(standing|sitting next to|sitting beside|moving toward|moves toward|walking toward|space between|between .* and|beside .* hip|near .* hip|in .* grasp|being touched|touching|grabbed|grabbing|held by|holding|pressed against|pressing against|leaning|straddl|kneel|on top of|underneath|behind .* body|against him|against her|kiss|kissing|sexual position|body position|blocking)\b/i.test(t);
+}
+
+function hasStableObjectAnchor(location) {
+    const t = sanitizeText(location).toLowerCase();
+    if (!t) return false;
+    return /\b(couch|bed|floor|table|desk|chair|counter|bench|bag|pocket|drawer|shelf|tripod|green-screen|camera|room|kitchen|bathroom|shower|door|wall|loungeroom|apartment|mansion|hallway|bar|bin|trash|basket)\b/i.test(t);
+}
+
+function shouldRejectSceneObject(obj, delta = null) {
+    const name = sanitizeText(obj?.name);
+    const location = sanitizeText(obj?.location);
+    if (!name || !location) return { reject: false, reason: '' };
+    if (isParticipantObjectName(name, delta)) {
+        return { reject: true, reason: 'Participant/body-blocking facts belong in present_entities, not nearby_objects.' };
+    }
+    if (isBodyPartOrTransientContactObjectName(name)) {
+        return { reject: true, reason: 'Body parts and transient physical contact are not stable nearby practical objects.' };
+    }
+    if (isTransientParticipantLocation(location) && !hasStableObjectAnchor(location)) {
+        return { reject: true, reason: 'Transient pose/contact/blocking location is not a stable object location.' };
+    }
+    if (/\b(unzipped|being touched|being grabbed|being held|pressed against|skin|body)\b/i.test(location) && !hasStableObjectAnchor(location)) {
+        return { reject: true, reason: 'Transient clothing/body interaction is not a stable scene object location.' };
+    }
+    return { reject: false, reason: '' };
+}
+
+function filterParticipantBlockingDelta(delta) {
+    if (!sceneReconciliationEnabled()) return delta;
+    const su = delta?.scene_update || {};
+    if (!Array.isArray(su.nearby_objects_add_or_update)) return delta;
+
+    const rejected = [];
+    const kept = [];
+    su.present_entities_add = su.present_entities_add || [];
+
+    for (const obj of su.nearby_objects_add_or_update) {
+        const name = sanitizeText(obj?.name);
+        const location = sanitizeText(obj?.location);
+        const decision = shouldRejectSceneObject({ name, location }, delta);
+        if (decision.reject) {
+            rejected.push({ candidate: `${location}: ${name}`, reason: decision.reason });
+            if (isParticipantObjectName(name, delta)) {
+                const ent = stripEntityQualifier(name);
+                const currentPresent = metadata().currentScene?.present_entities || [];
+                const alreadyPresent = currentPresent.some(existing => sameText(stripEntityQualifier(existing), ent))
+                    || su.present_entities_add.some(existing => sameText(stripEntityQualifier(existing), ent));
+                if (ent && !alreadyPresent) su.present_entities_add.push(ent);
+            }
+            continue;
+        }
+        kept.push(obj);
+    }
+
+    su.nearby_objects_add_or_update = kept;
+    if (rejected.length) {
+        delta.rejected_candidates = [ ...(delta.rejected_candidates || []), ...rejected ];
+        if (!hasSubstantiveDelta(delta) && !delta.no_update_reason) {
+            delta.no_update_reason = 'Extractor proposed only transient participant/body-position facts; no stable Phase 1 scene update remains.';
+        }
+    }
+    return delta;
+}
+
+function reconcileSceneObjectsForStorage(scene) {
+    if (!sceneReconciliationEnabled()) return scene;
+    const kept = [];
+    for (const obj of scene.nearby_objects || []) {
+        const decision = shouldRejectSceneObject(obj, { scene_update: { present_entities_add: scene.present_entities || [] } });
+        if (!decision.reject) kept.push(obj);
+    }
+    scene.nearby_objects = kept;
+    return scene;
+}
+
+function objectCoalescingEnabled() {
+    return (settings().objectCoalescingMode || 'conservative') !== 'off';
+}
+
+function objectLocationGroupKey(obj, fallbackScene = '') {
+    const location = sanitizeText(obj?.location);
+    const sceneRef = sanitizeText(obj?.scene_ref || fallbackScene);
+    return `${sceneRef.toLowerCase()}||${location.toLowerCase()}`;
+}
+
+function parseCashAmount(text) {
+    const t = sanitizeText(text);
+    if (!t) return null;
+    if (/cash register|cash box|cashier/i.test(t)) return null;
+    let m = /(?:AUD\s*)?\$\s*(\d+(?:\.\d{1,2})?)/i.exec(t);
+    if (m) return Number(m[1]);
+    m = /\b(\d+(?:\.\d{1,2})?)\s*(?:dollars?|bucks?)\b/i.exec(t);
+    if (m) return Number(m[1]);
+    return null;
+}
+
+function isCashObject(obj) {
+    const name = sanitizeText(obj?.name);
+    return parseCashAmount(name) !== null && /\$|cash|money|dollars?|bucks?/i.test(name);
+}
+
+function componentKey(component) {
+    return `${sanitizeText(component?.name).toLowerCase()}||${Number(component?.amount || 0)}`;
+}
+
+function cashComponentsFromObject(obj) {
+    const existing = Array.isArray(obj?.components) ? obj.components : [];
+    const out = [];
+    for (const c of existing) {
+        const amount = Number(c?.amount ?? parseCashAmount(c?.name));
+        const name = sanitizeText(c?.name || obj?.name);
+        if (name && Number.isFinite(amount) && amount > 0) out.push({ name, amount });
+    }
+    if (out.length) return out;
+    const amount = parseCashAmount(obj?.name);
+    const name = sanitizeText(obj?.name);
+    if (name && Number.isFinite(amount) && amount > 0) return [{ name, amount }];
+    return [];
+}
+
+function formatMoneyAmount(amount) {
+    const n = Number(amount || 0);
+    return Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/0+$/,'').replace(/\.$/,'');
+}
+
+function normalizeGenericObjectName(name) {
+    let t = sanitizeText(name).toLowerCase();
+    if (!t) return '';
+    if (/\b(sage|davo|josy|quinn|maya|bella|jill|mc|user)'s\b/i.test(t)) return '';
+    if (/\b(phone|key|keycard|letter|note|weapon|gun|knife|evidence|gift|bag|jacket|shirt|pants|dress|bra|underwear|contract|document|id card|wallet|purse)\b/i.test(t)) return '';
+    if (!/\b(bottle|can|cup|glass|plate|paper|flyer|ticket|napkin|coin|beer|shot)\b/i.test(t)) return '';
+    t = t.replace(/\s+from\s+.+$/i, '');
+    t = t.replace(/\s*\([^)]*\)\s*$/g, '');
+    t = t.replace(/\s+/g, ' ').trim();
+    t = t.replace(/s$/i, '');
+    return t;
+}
+
+function pluralizeGenericName(base, count) {
+    if (count === 1) return base;
+    if (/y$/i.test(base)) return base.replace(/y$/i, 'ies');
+    if (/(s|x|ch|sh)$/i.test(base)) return `${base}es`;
+    return `${base}s`;
+}
+
+function coalesceNearbyObjects(objects, fallbackScene = '', turn = 0) {
+    if (!objectCoalescingEnabled()) return Array.isArray(objects) ? objects : [];
+    const input = (Array.isArray(objects) ? objects : []).filter(o => o && (o.name || o.location));
+    if (!input.length) return [];
+
+    const used = new Set();
+    const result = [];
+
+    const cashGroups = new Map();
+    input.forEach((obj, idx) => {
+        if (!isCashObject(obj)) return;
+        const key = objectLocationGroupKey(obj, fallbackScene);
+        if (!cashGroups.has(key)) cashGroups.set(key, []);
+        cashGroups.get(key).push({ obj, idx });
+    });
+
+    for (const group of cashGroups.values()) {
+        const components = [];
+        const seenComponents = new Set();
+        for (const { obj, idx } of group) {
+            for (const comp of cashComponentsFromObject(obj)) {
+                const key = componentKey(comp);
+                if (!key || seenComponents.has(key)) continue;
+                seenComponents.add(key);
+                components.push(comp);
+            }
+            used.add(idx);
+        }
+        const total = components.reduce((sum, c) => sum + Number(c.amount || 0), 0);
+        if (total > 0) {
+            const first = group[0].obj;
+            result.push({
+                name: `$${formatMoneyAmount(total)} cash`,
+                location: sanitizeText(first.location),
+                scene_ref: sanitizeText(first.scene_ref || fallbackScene),
+                evidence: `Coalesced cash from: ${components.map(c => c.name).join('; ')}`,
+                last_updated_turn: turn || first.last_updated_turn || 0,
+                coalesced_category: 'cash',
+                quantity: total,
+                unit: '$',
+                components
+            });
+        }
+    }
+
+    const genericGroups = new Map();
+    input.forEach((obj, idx) => {
+        if (used.has(idx)) return;
+        const base = normalizeGenericObjectName(obj.name);
+        if (!base) return;
+        const key = `${objectLocationGroupKey(obj, fallbackScene)}||${base}`;
+        if (!genericGroups.has(key)) genericGroups.set(key, { base, entries: [] });
+        genericGroups.get(key).entries.push({ obj, idx });
+    });
+
+    for (const group of genericGroups.values()) {
+        if (group.entries.length < 2) continue;
+        const first = group.entries[0].obj;
+        for (const { idx } of group.entries) used.add(idx);
+        result.push({
+            name: `${group.entries.length} ${pluralizeGenericName(group.base, group.entries.length)}`,
+            location: sanitizeText(first.location),
+            scene_ref: sanitizeText(first.scene_ref || fallbackScene),
+            evidence: `Coalesced from: ${group.entries.map(e => sanitizeText(e.obj.name)).join('; ')}`,
+            last_updated_turn: turn || first.last_updated_turn || 0,
+            coalesced_category: 'generic',
+            quantity: group.entries.length,
+            components: group.entries.map(e => ({ name: sanitizeText(e.obj.name), amount: 1 }))
+        });
+    }
+
+    input.forEach((obj, idx) => {
+        if (!used.has(idx)) result.push(obj);
+    });
+    return result;
+}
+
+function coalesceSceneUpdateObjects(delta) {
+    if (!objectCoalescingEnabled()) return delta;
+    const su = delta?.scene_update;
+    if (!su || !Array.isArray(su.nearby_objects_add_or_update)) return delta;
+    const sceneRef = sanitizeText(su.location_ref || metadata().currentScene?.location_ref);
+    su.nearby_objects_add_or_update = coalesceNearbyObjects(su.nearby_objects_add_or_update, sceneRef, 0);
+    return delta;
+}
+
+function normalizeProposal(raw) {
+    const normalized = {
+        scene_update: {
+            location_ref: raw?.scene_update?.location_ref ?? null,
+            present_entities_add: Array.isArray(raw?.scene_update?.present_entities_add) ? raw.scene_update.present_entities_add : [],
+            present_entities_remove: Array.isArray(raw?.scene_update?.present_entities_remove) ? raw.scene_update.present_entities_remove : [],
+            nearby_objects_add_or_update: Array.isArray(raw?.scene_update?.nearby_objects_add_or_update) ? raw.scene_update.nearby_objects_add_or_update : [],
+            nearby_objects_remove: Array.isArray(raw?.scene_update?.nearby_objects_remove) ? raw.scene_update.nearby_objects_remove : [],
+            surroundings_summary: raw?.scene_update?.surroundings_summary ?? null
+        },
+        recent_event_updates: Array.isArray(raw?.recent_event_updates) ? raw.recent_event_updates : [],
+        resolved_event_updates: Array.isArray(raw?.resolved_event_updates) ? raw.resolved_event_updates : [],
+        rejected_candidates: Array.isArray(raw?.rejected_candidates) ? raw.rejected_candidates : [],
+        no_update_reason: raw?.no_update_reason || ''
+    };
+
+    normalized.recent_event_updates = normalized.recent_event_updates
+        .filter(e => e && (e.summary || e.causal_result || e.evidence))
+        .map(e => ({
+            summary: sanitizeText(e.summary),
+            causal_result: sanitizeText(e.causal_result),
+            resolved: Boolean(e.resolved),
+            importance_score: Number(e.importance_score || 0),
+            evidence: sanitizeText(e.evidence)
+        }));
+
+    if (settings().strictRecentEvents) {
+        const keptEvents = [];
+        const rejectedEventCandidates = [];
+        const minImportance = Number(settings().minEventImportance || 4);
+        const maxEvents = Math.max(0, Number(settings().maxEventsPerProposal || 1));
+        for (const ev of normalized.recent_event_updates) {
+            const gate = eventGateReason(ev, minImportance, normalized.scene_update);
+            if (gate) {
+                rejectedEventCandidates.push({
+                    candidate: ev.summary || ev.causal_result || '(recent event candidate)',
+                    reason: gate
+                });
+            } else {
+                keptEvents.push(ev);
+            }
+        }
+        keptEvents.sort((a, b) => Number(b.importance_score || 0) - Number(a.importance_score || 0));
+        const allowed = keptEvents.slice(0, maxEvents);
+        for (const ev of keptEvents.slice(maxEvents)) {
+            rejectedEventCandidates.push({
+                candidate: ev.summary || ev.causal_result || '(recent event candidate)',
+                reason: `Dropped by sparse event cap: max ${maxEvents} new RecentEvent(s) per extraction.`
+            });
+        }
+        normalized.recent_event_updates = allowed;
+        normalized.rejected_candidates.push(...rejectedEventCandidates);
+    }
+
+    normalized.resolved_event_updates = normalized.resolved_event_updates
+        .filter(e => e && (e.matches_existing_event || e.resolution || e.evidence))
+        .map(e => ({
+            matches_existing_event: sanitizeText(e.matches_existing_event),
+            resolution: sanitizeText(e.resolution),
+            evidence: sanitizeText(e.evidence)
+        }));
+
+    normalized.rejected_candidates = normalized.rejected_candidates
+        .filter(e => e && (e.candidate || e.reason))
+        .map(e => ({ candidate: sanitizeText(e.candidate), reason: sanitizeText(e.reason) }));
+
+    normalized.scene_update.nearby_objects_add_or_update = normalized.scene_update.nearby_objects_add_or_update
+        .filter(o => o && (o.name || o.location))
+        .map(o => ({
+            name: sanitizeText(o.name),
+            location: sanitizeText(o.location),
+            evidence: sanitizeText(o.evidence)
+        }));
+
+    normalized.scene_update.nearby_objects_remove = normalized.scene_update.nearby_objects_remove
+        .map(objectRemoveName)
+        .filter(Boolean);
+    normalized.scene_update.present_entities_add = normalized.scene_update.present_entities_add.map(sanitizeText).filter(Boolean);
+    normalized.scene_update.present_entities_remove = normalized.scene_update.present_entities_remove.map(sanitizeText).filter(Boolean);
+    if (normalized.scene_update.location_ref !== null) normalized.scene_update.location_ref = sanitizeText(normalized.scene_update.location_ref);
+    if (normalized.scene_update.surroundings_summary !== null) normalized.scene_update.surroundings_summary = sanitizeText(normalized.scene_update.surroundings_summary);
+
+    filterParticipantBlockingDelta(normalized);
+    normalizeSplitRemoteSceneDelta(normalized);
+    filterSurroundingsDelta(normalized);
+    coalesceSceneUpdateObjects(normalized);
+    return filterNoOpSceneDelta(normalized);
+}
+
+
+function normalizeSplitRemoteSceneDelta(delta) {
+    if (!settings().remoteCommunicationCuePrefilter) return delta;
+    const su = delta?.scene_update || {};
+    const combined = [su.location_ref, su.surroundings_summary, recentChatText(12)].map(sanitizeText).join(' ').toLowerCase();
+    const splitLikely = /\bsplit scene\b|\bphysically separated\b|\bremote\b|\btext(?:s|ing)?\b|\bphone\b|\bcall(?:s|ing)?\b|\bexam hall\b|\bhots kitchen\b/.test(combined)
+        && /\b(davo|sage)\b/.test(combined);
+    if (!splitLikely) return delta;
+
+    const addSet = new Set((su.present_entities_add || []).map(canonicalKey));
+    const hasQualified = (su.present_entities_add || []).some(ent => /—|\bremote\b|\blocal\b|\btexting\b|\bphone\b|\bexam hall\b|\bkitchen\b/i.test(ent));
+    const currentPresent = Array.isArray(metadata().currentScene?.present_entities) ? metadata().currentScene.present_entities : [];
+
+    // Avoid false co-presence: if the model added qualified split-entities, remove old unqualified entries.
+    if (hasQualified) {
+        su.present_entities_remove = su.present_entities_remove || [];
+        for (const ent of currentPresent) {
+            const plain = sanitizeText(ent);
+            if (!plain) continue;
+            if (/—|\bremote\b|\blocal\b|\btexting\b|\bphone\b/i.test(plain)) continue;
+            const firstName = canonicalKey(plain.split(/\s+/)[0]);
+            const covered = [...addSet].some(x => firstName && x.includes(firstName));
+            if (covered && !su.present_entities_remove.some(existing => sameText(existing, plain))) {
+                su.present_entities_remove.push(plain);
+            }
+        }
+    }
+
+    if (su.location_ref && !/^split scene\s*:/i.test(su.location_ref) && /\b(text|phone|call|remote|physically separated|exam hall)\b/i.test(combined)) {
+        delta.rejected_candidates = [
+            ...(delta.rejected_candidates || []),
+            { candidate: 'Split-location remote communication', reason: 'Ensure packet does not imply physical co-presence; location_ref should be a split-scene line if both characters remain active in different places.' }
+        ];
+    }
+    return delta;
+}
+
+function isSplitSceneState(scene) {
+    const combined = `${scene?.location_ref || ''} ${scene?.surroundings_summary || ''}`.toLowerCase();
+    return /\bsplit scene\b|\bphysically separated\b|\bremote\b|\btexting\b|\bphone\b|\bexam hall\b/.test(combined)
+        && /\b(davo|sage)\b/.test(combined);
+}
+
+function filterSurroundingsDelta(delta) {
+    const su = delta?.scene_update || {};
+    if (su.surroundings_summary === null || su.surroundings_summary === undefined || su.surroundings_summary === '') return delta;
+    const mode = settings().surroundingsUpdateMode || 'location_only';
+    if (mode === 'normal') return delta;
+
+    const current = metadata().currentScene || EMPTY_SCENE;
+    const nextLocation = sanitizeText(su.location_ref);
+    const currentLocation = sanitizeText(current.location_ref);
+    const locationChanges = Boolean(nextLocation && currentLocation && !sameText(nextLocation, currentLocation));
+    const initialLocationSet = Boolean(nextLocation && !currentLocation);
+    const summary = sanitizeText(su.surroundings_summary);
+
+    if (locationChanges || initialLocationSet) return delta;
+    if (isStableEnvironmentSurroundings(summary)) return delta;
+    if (isRemoteCommunicationSurroundings(summary)) return delta;
+
+    const reason = isTransientBodyOrInteractionSummary(summary)
+        ? 'Suppressed surroundings update: body position/touch/intensity/blocking changes are not stable scene surroundings.'
+        : 'Suppressed surroundings update: location-only mode allows surroundings changes only for location/sub-location or stable environmental anchors.';
+    su.surroundings_summary = null;
+    delta.rejected_candidates = [
+        ...(delta.rejected_candidates || []),
+        { candidate: `Surroundings: ${summary}`, reason }
+    ];
+    if (!hasSubstantiveDelta(delta) && !delta.no_update_reason) {
+        delta.no_update_reason = 'Only a non-stable surroundings change was proposed.';
+    }
+    return delta;
+}
+
+function isStableEnvironmentSurroundings(text) {
+    const t = sanitizeText(text).toLowerCase();
+    if (!t) return false;
+    const stableEnvironment = /\b(door|window|lock|locked|unlocked|open|opened|closed|shut|lights?|dark|lit|lamp|power|outage|shower|bathroom|water|running|faucet|tap|flood|flooded|smoke|fire|alarm|broken|breaks|damaged|spilled|spill|mess|blocked|barricaded|curtain|blind|heater|fan|air conditioner|ac)\b/;
+    const subLocation = /\b(bathroom|shower|hallway|corridor|doorway|entrance|balcony|outside|inside|kitchen|office|garage|car|street|yard|library|cafeteria|classroom|bedroom)\b/;
+    return stableEnvironment.test(t) || subLocation.test(t);
+}
+
+function isRemoteCommunicationSurroundings(text) {
+    const t = sanitizeText(text).toLowerCase();
+    if (!t) return false;
+    return /\b(texting|text message|phone|call|calling|video call|physically separated|remote communication|not in the same room|split scene|exam hall)\b/.test(t)
+        && /\b(davo|sage)\b/.test(t);
+}
+
+function isTransientBodyOrInteractionSummary(text) {
+    const t = sanitizeText(text).toLowerCase();
+    if (!t) return false;
+    return /\b(kiss|kissing|touch|touching|grab|grabs|grabbing|hold|holds|holding|waist|hips?|chest|thigh|legs?|arms?|hands?|body|bodies|position|pose|posing|on top|underneath|behind|against him|against her|leaning|straddl|kneel|standing over|bent|press(?:ed|ing)?|intensity|tempo|rhythm|moan|sexual|intimate)\b/.test(t);
+}
+
+function filterNoOpSceneDelta(delta) {
+    const m = metadata();
+    const current = m.currentScene || EMPTY_SCENE;
+    const su = delta.scene_update || {};
+    const rejected = [];
+
+    if (su.location_ref !== null && sameText(su.location_ref, current.location_ref)) {
+        rejected.push({ candidate: `Current location: ${su.location_ref}`, reason: 'No-op scene update: current location is already stored.' });
+        su.location_ref = null;
+    }
+
+    if (su.surroundings_summary !== null && sameText(su.surroundings_summary, current.surroundings_summary)) {
+        rejected.push({ candidate: `Surroundings: ${su.surroundings_summary}`, reason: 'No-op scene update: surroundings summary is already stored.' });
+        su.surroundings_summary = null;
+    }
+
+    const present = Array.isArray(current.present_entities) ? current.present_entities : [];
+    su.present_entities_add = (su.present_entities_add || []).filter(ent => {
+        if (present.some(existing => sameText(existing, ent))) {
+            rejected.push({ candidate: `Present entity: ${ent}`, reason: 'No-op entity update: entity is already present.' });
+            return false;
+        }
+        return true;
+    });
+    su.present_entities_remove = (su.present_entities_remove || []).filter(ent => {
+        if (!present.some(existing => sameText(existing, ent))) {
+            rejected.push({ candidate: `Remove present entity: ${ent}`, reason: 'No-op entity removal: entity is not currently present.' });
+            return false;
+        }
+        return true;
+    });
+
+    const proposedUpdatesByName = new Map();
+    const keptUpdates = [];
+
+    for (const obj of su.nearby_objects_add_or_update || []) {
+        const name = sanitizeText(obj?.name);
+        const location = sanitizeText(obj?.location);
+        if (!name || !location) continue;
+        const existing = findCurrentObjectByName(name);
+        if (existing && objectLocationSame(existing, obj)) {
+            const loc = displayLocationForObject(existing.location, existing.scene_ref || current.location_ref);
+            rejected.push({ candidate: `${loc}: ${name}`, reason: 'No-op object update: object is already stored at that location.' });
+            proposedUpdatesByName.set(canonicalKey(name), { obj, noOp: true });
+            continue;
+        }
+        keptUpdates.push(obj);
+        proposedUpdatesByName.set(canonicalKey(name), { obj, noOp: false });
+    }
+    su.nearby_objects_add_or_update = keptUpdates;
+
+    const seenRemoves = new Set();
+    const keptRemoves = [];
+    for (const rawRemove of su.nearby_objects_remove || []) {
+        const name = objectRemoveName(rawRemove);
+        const key = canonicalKey(name);
+        if (!key || seenRemoves.has(key)) continue;
+        seenRemoves.add(key);
+
+        const currentObj = findCurrentObjectByName(name);
+        const proposed = proposedUpdatesByName.get(key);
+        if (proposed) {
+            const loc = currentObj
+                ? displayLocationForObject(currentObj.location, currentObj.scene_ref || current.location_ref)
+                : displayLocationForObject(proposed.obj?.location, current.location_ref);
+            rejected.push({ candidate: `Remove ${loc ? loc + ': ' : ''}${name}`, reason: 'Conflicting object removal dropped: same proposal also states the object is present/updated.' });
+            continue;
+        }
+        if (!currentObj) {
+            rejected.push({ candidate: `Remove object: ${name}`, reason: 'No-op object removal: object is not currently stored.' });
+            continue;
+        }
+        keptRemoves.push(name);
+    }
+    su.nearby_objects_remove = keptRemoves;
+
+    if (rejected.length) {
+        delta.rejected_candidates = [ ...(delta.rejected_candidates || []), ...rejected ];
+        if (!hasSubstantiveDelta(delta) && !delta.no_update_reason) {
+            delta.no_update_reason = 'Extractor proposed only no-op or contradictory scene changes already covered by the applied state.';
+        }
+    }
+    return delta;
+}
+
+function findCurrentObjectByName(name) {
+    const currentObjects = metadata().currentScene?.nearby_objects || [];
+    return currentObjects.find(o => sameText(o?.name, name)) || null;
+}
+
+function objectLocationSame(existing, proposed) {
+    if (!existing || !proposed) return false;
+    const currentScene = metadata().currentScene?.location_ref || '';
+    const existingDisplay = displayLocationForObject(existing.location, existing.scene_ref || currentScene);
+    const proposedDisplay = displayLocationForObject(proposed.location, proposed.scene_ref || currentScene);
+    if (sameText(existingDisplay, proposedDisplay)) return true;
+    if (sameText(existing.location, proposed.location)) return true;
+    return false;
+}
+
+function eventGateReason(event, minImportance, sceneUpdate = null) {
+    const summary = sanitizeText(event?.summary);
+    const result = sanitizeText(event?.causal_result);
+    const evidence = sanitizeText(event?.evidence);
+    const score = Number(event?.importance_score || 0);
+    if (!summary) return 'Dropped RecentEvent candidate: missing summary.';
+    if (!result) return 'Dropped RecentEvent candidate: no unresolved practical causal result.';
+    if (!evidence) return 'Dropped RecentEvent candidate: no source evidence.';
+    if (score < minImportance) return `Dropped RecentEvent candidate: importance ${score} below strict threshold ${minImportance}.`;
+
+    const combined = `${summary} ${result}`.toLowerCase();
+
+    const relationshipStatusPattern = /\b(girlfriend|boyfriend|partner|relationship|dating|official|couple|accepted .* request|agreed .* relationship|relationship status changed|became .* girlfriend|became .* boyfriend|became .* partner)\b/;
+    const durableRoleStatusPattern = /\b(designat(?:ed|es)|establish(?:ed|es)|accepted|agreed|acknowledg(?:ed|es)|relationship\/role status changed|role status changed|explicitly .* as|called .* master|calls .* master|called .* mistress|calls .* mistress|safe word|safeword|protocol)\b/;
+    const roleStatusPattern = /\b(master|mistress|dominant|submissive|dom\b|sub\b|owner|owned by|belong to|belongs to|claimed by|claim(?:ed)? .* as)\b/;
+    const hasRelationshipStatusCue = relationshipStatusPattern.test(combined) || (roleStatusPattern.test(combined) && durableRoleStatusPattern.test(combined));
+
+    const socialSexualColour = /\b(sexual|intimacy|intimate|undressed|removed .* pants|partially undressed|scandal|scandalous|shock|shocked|tension|social dynamic|escalated|highly sexualized|flirt|banter)\b/;
+    if (socialSexualColour.test(combined) && !hasRelationshipStatusCue && !/\b(safe word|safeword|protocol|must respond|rule)\b/.test(combined)) {
+        return 'Dropped RecentEvent candidate: social/sexual colour or transient escalation, not a durable Phase 1 event.';
+    }
+
+    const unresolvedPracticalPatterns = [
+        /\b(broke|broken|breaks|damaged|damage|lost|missing|can't find|cannot find|not found|hid|hidden|stolen)\b/,
+        /\b(promised|promise|agreed to|agreement|asked .* to|requested|request|task|deadline|urgent|must|needs to|need to|has to|still needs)\b/,
+        /\b(plan changed|change of plan|new plan|remind|remember|waiting for|depends on|blocked|can't continue|cannot continue|owe|owed|due)\b/,
+        /\b(interrupted by|alarm|phone call|knock at the door|emergency)\b/
+    ];
+    const hasUnresolvedPracticalCue = unresolvedPracticalPatterns.some(re => re.test(combined));
+    if (!hasUnresolvedPracticalCue && !hasRelationshipStatusCue) {
+        return 'Dropped RecentEvent candidate: no clear unresolved task/problem/changed-plan/relationship-status consequence beyond CurrentScene.';
+    }
+
+    if (sceneUpdate && eventDuplicatesSceneDelta(event, sceneUpdate)) {
+        return 'Dropped RecentEvent candidate: already captured by CurrentScene/object state.';
+    }
+
+    return '';
+}
+
+function eventDuplicatesSceneDelta(event, sceneUpdate) {
+    const combined = `${event?.summary || ''} ${event?.causal_result || ''}`.toLowerCase();
+    const objectUpdates = Array.isArray(sceneUpdate?.nearby_objects_add_or_update) ? sceneUpdate.nearby_objects_add_or_update : [];
+    const objectRemoves = Array.isArray(sceneUpdate?.nearby_objects_remove) ? sceneUpdate.nearby_objects_remove.map(objectRemoveName) : [];
+    for (const obj of objectUpdates) {
+        const name = sanitizeText(obj?.name).toLowerCase();
+        if (name && combined.includes(name)) return true;
+    }
+    for (const nameRaw of objectRemoves) {
+        const name = sanitizeText(nameRaw).toLowerCase();
+        if (name && combined.includes(name)) return true;
+    }
+    if (sceneUpdate?.location_ref && /\b(location|setting|scene|arrives?|returns?|leaves?|enters?)\b/.test(combined)) return true;
+    if ((sceneUpdate?.present_entities_add?.length || sceneUpdate?.present_entities_remove?.length) && /\b(arrives?|returns?|leaves?|enters?|present|alone)\b/.test(combined)) return true;
+    return false;
+}
+
+function eventRenderable(event) {
+    if (!event || event.resolved) return false;
+    if (!settings().strictRecentEvents) return true;
+    return !eventGateReason(event, Number(settings().minEventImportance || 4), null);
+}
 
 function pruneStoredRecentEvents() {
     const m = metadata();
     const before = (m.recentEvents || []).length;
-    m.recentEvents = coalesceRecentEvents(m.recentEvents || []).filter(eventRenderable);
+    m.recentEvents = (m.recentEvents || []).filter(eventRenderable);
     const maxEvents = Math.max(1, Number(settings().unresolvedEventLimit || 6));
     m.recentEvents = m.recentEvents.slice(0, maxEvents);
     saveMetadataNow();
@@ -222,6 +1297,19 @@ function pruneStoredRecentEvents() {
     toastInfo(`Pruned ${before - m.recentEvents.length} stored RecentEvent(s).`);
 }
 
+function hasSubstantiveDelta(delta) {
+    const s = delta?.scene_update || {};
+    return Boolean(
+        s.location_ref ||
+        s.surroundings_summary ||
+        s.present_entities_add?.length ||
+        s.present_entities_remove?.length ||
+        s.nearby_objects_add_or_update?.length ||
+        s.nearby_objects_remove?.length ||
+        delta?.recent_event_updates?.length ||
+        delta?.resolved_event_updates?.length
+    );
+}
 
 let inFlight = false;
 let queuedReason = '';
@@ -271,18 +1359,8 @@ async function runExtraction(reason = 'manual') {
     inFlight = true;
     updateUiStatus('running', `Running extractor (${reason})...`);
     try {
-        let promptPayload = buildExtractorUserPayload();
-        let raw;
-        let compactRetryUsed = false;
-        try {
-            raw = await callExtractor(promptPayload);
-        } catch (error) {
-            if (!isContextExceededError(error)) throw error;
-            compactRetryUsed = true;
-            updateUiStatus('running', 'Context exceeded; retrying extractor with compact payload...');
-            promptPayload = buildExtractorUserPayload({ compact: true });
-            raw = await callExtractor(promptPayload);
-        }
+        const promptPayload = buildExtractorUserPayload();
+        const raw = await callExtractor(promptPayload);
         const delta = normalizeProposal(raw);
         const proposal = {
             id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -291,8 +1369,6 @@ async function runExtraction(reason = 'manual') {
             chat_signature: sig,
             turn_count: (ctx().chat || []).length,
             status: hasSubstantiveDelta(delta) ? 'pending' : 'no_update',
-            context_retry_used: compactRetryUsed,
-            extractor_payload_chars: metadata().lastExtractorPayloadChars || promptPayload.length,
             delta,
             raw
         };
@@ -458,7 +1534,6 @@ function applyProposalObject(proposal) {
     }
 
     const maxEvents = Math.max(1, Number(settings().unresolvedEventLimit || 6));
-    m.recentEvents = coalesceRecentEvents(m.recentEvents || []);
     if (!settings().keepResolvedEvents) {
         m.recentEvents = m.recentEvents.filter(eventRenderable).slice(0, maxEvents);
     } else if (settings().strictRecentEvents) {
@@ -474,6 +1549,19 @@ function rejectProposalById(id) {
     for (const p of m.auditLog) if (p.id === id) p.status = 'rejected';
 }
 
+function addUnique(arr, value) {
+    if (!value) return;
+    if (!arr.some(x => sameText(x, value))) arr.push(value);
+}
+
+function removeByCaseInsensitive(arr, value) {
+    const i = arr.findIndex(x => sameText(x, value));
+    if (i >= 0) arr.splice(i, 1);
+}
+
+function sameText(a, b) {
+    return String(a || '').trim().toLowerCase() === String(b || '').trim().toLowerCase();
+}
 
 function groupObjectsByLocation(objects) {
     const groups = [];
@@ -557,7 +1645,7 @@ function renderPackets() {
     sceneLines.push(...groupedObjectLines(scene.nearby_objects));
     if (scene.surroundings_summary) sceneLines.push(`Surroundings: ${scene.surroundings_summary}`);
 
-    const eventLines = coalesceRecentEvents(m.recentEvents || [])
+    const eventLines = (m.recentEvents || [])
         .filter(eventRenderable)
         .slice(0, Number(settings().unresolvedEventLimit || 6))
         .map(e => e.causal_result ? `${e.summary}; result: ${e.causal_result}` : e.summary);
@@ -589,7 +1677,6 @@ function renderProposalSummary(proposal) {
     lines.push(`Review order: ${proposal.status === 'pending' ? 'next pending proposal (oldest first)' : 'not pending / audit view'}`);
     lines.push(`Reason: ${proposal.reason || 'unknown'}`);
     lines.push(`Turn count: ${proposal.turn_count ?? 'unknown'}`);
-    if (proposal.extractor_payload_chars) lines.push(`Extractor payload: ${proposal.extractor_payload_chars} chars${proposal.context_retry_used ? ' (compact retry used)' : ''}`);
     if (proposal.stale_scene_update_skipped) lines.push(`Stale scene update skipped: ${proposal.stale_scene_update_skipped}`);
     lines.push('');
 
@@ -831,9 +1918,6 @@ function updatePanel() {
     setInputValue('sfe_apikey', s.apiKey);
     setInputValue('sfe_recent_limit', s.recentMessageLimit);
     setInputValue('sfe_max_tokens', s.maxTokens);
-    setInputValue('sfe_max_input_chars', s.maxInputCharsPerTurn);
-    setInputValue('sfe_max_previous_events_payload', s.maxPreviousRecentEventsForPayload);
-    setInputValue('sfe_max_payload_chars', s.maxExtractorPayloadChars);
     setInputValue('sfe_trigger', s.trigger);
     setInputValue('sfe_autorun_policy', s.autoRunPolicy);
     setInputValue('sfe_periodic_user_messages', s.periodicUserMessages);
@@ -845,7 +1929,6 @@ function updatePanel() {
     setInputValue('sfe_strict_events', s.strictRecentEvents, 'checked');
     setInputValue('sfe_min_event_importance', s.minEventImportance);
     setInputValue('sfe_max_events_per_proposal', s.maxEventsPerProposal);
-    setInputValue('sfe_recent_event_coalescing_mode', s.recentEventsCoalescingMode || 'conservative');
     setInputValue('sfe_clear_objects_on_location_change', s.clearRoomObjectsOnLocationChange, 'checked');
     setInputValue('sfe_surroundings_mode', s.surroundingsUpdateMode || 'location_only');
     setInputValue('sfe_object_coalescing_mode', s.objectCoalescingMode || 'conservative');
@@ -873,7 +1956,7 @@ ${m.lastRawExtractorText}` : 'No extractor output yet.');
         const pending = m.pendingProposals.filter(p => p.status === 'pending').length;
         const next = pendingProposalsOrdered()[0];
         const nextText = next ? ` | next pending turn: ${next.turn_count ?? '?'}` : '';
-        countEl.textContent = `v${EXTENSION_VERSION} | pending ${pending}${nextText} | runs ${m.auditLog.length} | skipped ${m.skippedRuns || 0} | payload ${m.lastExtractorPayloadChars || 0} chars | last run ${m.lastRunAt || 'never'} | last skip ${m.lastSkipReason || 'none'}`;
+        countEl.textContent = `v${EXTENSION_VERSION} | pending ${pending}${nextText} | runs ${m.auditLog.length} | skipped ${m.skippedRuns || 0} | last run ${m.lastRunAt || 'never'} | last skip ${m.lastSkipReason || 'none'}`;
     }
 
     if (m.lastError) updateUiStatus('bad', `Last error: ${m.lastError}`);
@@ -981,14 +2064,12 @@ function installUi() {
         <div class="sfe-row"><label for="sfe_model">Model</label><input id="sfe_model" type="text" spellcheck="false"></div>
         <div class="sfe-row"><label for="sfe_apikey">API key</label><input id="sfe_apikey" type="text" spellcheck="false" placeholder="blank for LM Studio"></div>
         <div class="sfe-row"><label for="sfe_recent_limit">Recent messages</label><input id="sfe_recent_limit" type="number" min="2" max="40" step="1"><label for="sfe_max_tokens">Max output tokens</label><input id="sfe_max_tokens" type="number" min="100" max="4000" step="50"></div>
-        <div class="sfe-row"><label for="sfe_max_input_chars">Max chars/message</label><input id="sfe_max_input_chars" type="number" min="200" max="4000" step="100"><label for="sfe_max_payload_chars">Max payload chars</label><input id="sfe_max_payload_chars" type="number" min="4000" max="60000" step="1000"></div>
-        <div class="sfe-row"><label for="sfe_max_previous_events_payload">Prev events in prompt</label><input id="sfe_max_previous_events_payload" type="number" min="0" max="12" step="1"><label><input id="sfe_json_response" type="checkbox"> Request JSON response_format</label></div>
+        <div class="sfe-row"><label><input id="sfe_json_response" type="checkbox"> Request JSON response_format</label></div>
       </fieldset>
 
       <fieldset><legend>Event gating</legend>
         <div class="sfe-row"><label><input id="sfe_strict_events" type="checkbox"> Strict RecentEvents gate</label></div>
         <div class="sfe-row"><label for="sfe_min_event_importance">Min event importance</label><input id="sfe_min_event_importance" type="number" min="0" max="5" step="1"><label for="sfe_max_events_per_proposal">Max events/proposal</label><input id="sfe_max_events_per_proposal" type="number" min="0" max="3" step="1"></div>
-        <div class="sfe-row"><label for="sfe_recent_event_coalescing_mode">RecentEvents coalescing</label><select id="sfe_recent_event_coalescing_mode"><option value="conservative">Conservative</option><option value="off">Off</option></select></div>
         <div class="sfe-row"><label><input id="sfe_event_cue_prefilter" type="checkbox"> High-salience event cue prefilter</label></div>
       </fieldset>
 
@@ -1016,9 +2097,6 @@ function installUi() {
     bindSetting('sfe_apikey', 'apiKey');
     bindSetting('sfe_recent_limit', 'recentMessageLimit', 'number');
     bindSetting('sfe_max_tokens', 'maxTokens', 'number');
-    bindSetting('sfe_max_input_chars', 'maxInputCharsPerTurn', 'number');
-    bindSetting('sfe_max_previous_events_payload', 'maxPreviousRecentEventsForPayload', 'number');
-    bindSetting('sfe_max_payload_chars', 'maxExtractorPayloadChars', 'number');
     bindSetting('sfe_trigger', 'trigger');
     bindSetting('sfe_autorun_policy', 'autoRunPolicy');
     bindSetting('sfe_periodic_user_messages', 'periodicUserMessages', 'number');
@@ -1030,7 +2108,6 @@ function installUi() {
     bindSetting('sfe_strict_events', 'strictRecentEvents', 'boolean');
     bindSetting('sfe_min_event_importance', 'minEventImportance', 'number');
     bindSetting('sfe_max_events_per_proposal', 'maxEventsPerProposal', 'number');
-    bindSetting('sfe_recent_event_coalescing_mode', 'recentEventsCoalescingMode');
     bindSetting('sfe_clear_objects_on_location_change', 'clearRoomObjectsOnLocationChange', 'boolean');
     bindSetting('sfe_surroundings_mode', 'surroundingsUpdateMode');
     bindSetting('sfe_object_coalescing_mode', 'objectCoalescingMode');
