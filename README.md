@@ -1,3 +1,30 @@
+# Sage Phase 1 Factoid Extractor v0.1.27
+
+## v0.1.27 changes
+
+- Adds conservative RecentEvents coalescing to reduce duplicate or near-duplicate recent-event memory items.
+- Coalesces stored RecentEvents before packet rendering and after proposal application.
+- Adds extractor context-budget protection:
+  - caps characters per recent chat message sent to the extractor,
+  - limits how many previous RecentEvents are sent back into the extractor prompt,
+  - limits total extractor payload character count,
+  - retries once with a compact payload if LM Studio returns a context-size error.
+- Adds UI controls for:
+  - Max chars/message,
+  - Previous events in prompt,
+  - Max payload chars,
+  - RecentEvents coalescing mode.
+- Bumps extension version to `0.1.27`.
+
+## v0.1.27 reason
+
+Testing showed two operational issues:
+
+1. Some RecentEvents were semantically similar and could accumulate as duplicate memory facts.
+2. LM Studio could reject extractor requests with `Context size has been exceeded` when the extractor prompt included a long system prompt, JSON schema response format, current scene state, stored RecentEvents, and multiple long group-chat turns.
+
+v0.1.27 keeps the extractor conservative while reducing prompt size and memory duplication.
+
 # Sage Phase 1 Factoid Extractor v0.1.26
 
 ## v0.1.26 changes

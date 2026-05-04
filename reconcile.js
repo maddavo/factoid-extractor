@@ -497,6 +497,147 @@ function isTransientBodyOrInteractionSummary(text) {
     return /\b(kiss|kissing|touch|touching|grab|grabs|grabbing|hold|holds|holding|waist|hips?|chest|thigh|legs?|arms?|hands?|body|bodies|position|pose|posing|on top|underneath|behind|against him|against her|leaning|straddl|kneel|standing over|bent|press(?:ed|ing)?|intensity|tempo|rhythm|moan|sexual|intimate)\b/.test(t);
 }
 
+
+function recentEventCoalescingEnabled() {
+    return (settings().recentEventsCoalescingMode || 'conservative') !== 'off';
+}
+
+const EVENT_STOPWORDS = new Set([
+    'the','a','an','and','or','but','if','then','with','without','to','of','in','on','at','by','for','from','as','is','are','was','were','be','been','being',
+    'has','have','had','does','do','did','will','would','could','should','may','might','must','can','cannot','not','no','yes','it','this','that','these','those',
+    'their','his','her','him','she','he','they','them','after','before','because','about','into','onto','over','under','again','still','now','just','very'
+]);
+
+const EVENT_PERSON_TOKENS = [
+    'davo','sage','quinn','maya','josy','jill','bella','isabella','zoey','riona','camila','lily','nicole','sarah','melanie','heather'
+];
+
+function eventText(event) {
+    return sanitizeText(`${event?.summary || ''} ${event?.causal_result || ''}`);
+}
+
+function normalizedEventText(event) {
+    return eventText(event)
+        .toLowerCase()
+        .replace(/[’']/g, '')
+        .replace(/[^a-z0-9$ ]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function eventTokenSet(event) {
+    const tokens = normalizedEventText(event)
+        .split(/\s+/)
+        .filter(t => t.length > 2 && !EVENT_STOPWORDS.has(t));
+    return new Set(tokens);
+}
+
+function eventPeopleSet(event) {
+    const text = normalizedEventText(event);
+    const people = new Set();
+    for (const person of EVENT_PERSON_TOKENS) {
+        if (new RegExp(`\\b${person}\\b`, 'i').test(text)) people.add(person);
+    }
+    return people;
+}
+
+function eventHasAny(text, words) {
+    return words.some(word => new RegExp(`\\b${word}\\b`, 'i').test(text));
+}
+
+function eventCategory(event) {
+    const text = normalizedEventText(event);
+    if (eventHasAny(text, ['girlfriend','boyfriend','partner','relationship','dating','official','couple','master','mistress','dominant','submissive','owner','owned','belongs','claimed','collar','protocol','safeword'])) return 'relationship_status';
+    if (eventHasAny(text, ['promise','promised','agreed','owes','owe','must','needs','need','task','deadline','plan','remind','remember','waiting','depends','blocked'])) return 'task_obligation';
+    if (eventHasAny(text, ['lost','missing','broken','stolen','hidden','damaged','locked','unlocked','open','closed'])) return 'practical_state';
+    if (eventHasAny(text, ['hurt','upset','cried','crying','tear','tears','distressed','worried','angry','embarrassed','ashamed'])) return 'emotional_consequence';
+    return 'general';
+}
+
+function setIntersects(a, b) {
+    for (const item of a) if (b.has(item)) return true;
+    return false;
+}
+
+function tokenJaccard(a, b) {
+    if (!a.size && !b.size) return 0;
+    let inter = 0;
+    for (const item of a) if (b.has(item)) inter++;
+    const union = new Set([...a, ...b]).size;
+    return union ? inter / union : 0;
+}
+
+function sameRecentEventCluster(a, b) {
+    const ta = normalizedEventText(a);
+    const tb = normalizedEventText(b);
+    if (!ta || !tb) return false;
+    if (ta === tb) return true;
+    if (ta.length > 24 && tb.includes(ta)) return true;
+    if (tb.length > 24 && ta.includes(tb)) return true;
+
+    const ca = eventCategory(a);
+    const cb = eventCategory(b);
+    const peopleA = eventPeopleSet(a);
+    const peopleB = eventPeopleSet(b);
+    const sharedPeople = setIntersects(peopleA, peopleB) || (!peopleA.size && !peopleB.size);
+
+    if (ca === 'relationship_status' && cb === 'relationship_status' && sharedPeople) return true;
+    if (ca === cb && ca !== 'general' && sharedPeople) {
+        const ja = tokenJaccard(eventTokenSet(a), eventTokenSet(b));
+        if (ja >= 0.28) return true;
+    }
+
+    const ja = tokenJaccard(eventTokenSet(a), eventTokenSet(b));
+    return sharedPeople && ja >= 0.45;
+}
+
+function mergeEvidence(a, b) {
+    const parts = [];
+    for (const item of [a, b]) {
+        const text = sanitizeText(item);
+        if (text && !parts.some(existing => sameText(existing, text))) parts.push(text);
+    }
+    return parts.join(' | ').slice(0, 500);
+}
+
+function chooseEventText(existingValue, incomingValue) {
+    const oldText = sanitizeText(existingValue);
+    const newText = sanitizeText(incomingValue);
+    if (!oldText) return newText;
+    if (!newText) return oldText;
+    if (newText.length > oldText.length && newText.length <= 240) return newText;
+    return oldText;
+}
+
+function mergeRecentEvent(existing, incoming) {
+    existing.summary = chooseEventText(existing.summary, incoming.summary);
+    existing.causal_result = chooseEventText(existing.causal_result, incoming.causal_result);
+    existing.resolved = Boolean(existing.resolved) || Boolean(incoming.resolved);
+    existing.importance_score = Math.max(Number(existing.importance_score || 0), Number(incoming.importance_score || 0));
+    existing.evidence = mergeEvidence(existing.evidence, incoming.evidence);
+    existing.created_turn = Math.min(Number(existing.created_turn || incoming.created_turn || 0), Number(incoming.created_turn || existing.created_turn || 0)) || existing.created_turn || incoming.created_turn;
+    existing.last_updated_turn = Math.max(Number(existing.last_updated_turn || 0), Number(incoming.last_updated_turn || 0));
+    return existing;
+}
+
+export function coalesceRecentEvents(events) {
+    const input = Array.isArray(events) ? events.filter(Boolean) : [];
+    if (!recentEventCoalescingEnabled()) return input;
+
+    const result = [];
+    for (const event of input) {
+        if (!eventRenderable(event)) continue;
+        const existing = result.find(candidate => sameRecentEventCluster(candidate, event));
+        if (existing) {
+            mergeRecentEvent(existing, event);
+        } else {
+            result.push({ ...event });
+        }
+    }
+    return result;
+}
+
+
 export function filterNoOpSceneDelta(delta) {
     const m = metadata();
     const current = m.currentScene || EMPTY_SCENE;

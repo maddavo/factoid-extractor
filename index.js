@@ -6,7 +6,7 @@ import { EXTRACTION_SYSTEM_PROMPT } from './prompt.js';
 import { buildLmStudioJsonSchemaResponseFormat } from './schema.js';
 import { parseJsonContent } from './json-repair.js';
 import { ctx, settings, saveSettings, defaultMetadata, metadata, saveMetadataNow, structuredCloneSafe, logDebug, toastInfo, toastWarn, toastError, sanitizeText, objectRemoveName, getRecentTurns, chatSignature, userMessageCount, recentChatText, addUnique, removeByCaseInsensitive, sameText } from './state.js';
-import { coalesceNearbyObjects, coalesceSceneUpdateObjects, normalizeProposal, isSplitSceneState, filterNoOpSceneDelta, eventGateReason, eventDuplicatesSceneDelta, eventRenderable, hasSubstantiveDelta, reconcileSceneObjectsForStorage } from './reconcile.js';
+import { coalesceNearbyObjects, coalesceSceneUpdateObjects, coalesceRecentEvents, normalizeProposal, isSplitSceneState, filterNoOpSceneDelta, eventGateReason, eventDuplicatesSceneDelta, eventRenderable, hasSubstantiveDelta, reconcileSceneObjectsForStorage } from './reconcile.js';
 
 function sceneMarkerDetected() {
     const pattern = settings().sceneMarkerRegex || DEFAULT_SETTINGS.sceneMarkerRegex;
@@ -93,15 +93,79 @@ function autoRunGate(reason) {
     return { run: false, reason: 'no scene/event/remote cue or marker and ' + intervalNotReached };
 }
 
-function buildExtractorUserPayload() {
+function truncateExtractorText(text, maxChars) {
+    const value = sanitizeText(text);
+    const limit = Math.max(120, Number(maxChars || 900));
+    if (value.length <= limit) return value;
+    return value.slice(0, limit - 24).trimEnd() + ' …[truncated]';
+}
+
+function compactRecentEventForPayload(event) {
+    return {
+        summary: truncateExtractorText(event?.summary, 260),
+        causal_result: truncateExtractorText(event?.causal_result, 260),
+        resolved: Boolean(event?.resolved),
+        importance_score: Number(event?.importance_score || 0),
+        evidence: truncateExtractorText(event?.evidence, 180)
+    };
+}
+
+function buildExtractorPayloadObject(options = {}) {
     const s = settings();
     const m = metadata();
-    return JSON.stringify({
-        task: 'Propose Phase 1 continuity state delta from recent SillyTavern chat turns.',
+    const compact = Boolean(options.compact);
+    const maxTurnChars = compact
+        ? Math.max(240, Math.floor(Number(s.maxInputCharsPerTurn || 900) / 2))
+        : Math.max(240, Number(s.maxInputCharsPerTurn || 900));
+    const recentLimit = compact
+        ? Math.max(2, Math.min(Number(s.recentMessageLimit || 6), 3))
+        : Number(s.recentMessageLimit || 6);
+    const maxPreviousEvents = compact
+        ? Math.max(1, Math.min(Number(s.maxPreviousRecentEventsForPayload || 4), 2))
+        : Math.max(0, Number(s.maxPreviousRecentEventsForPayload || 4));
+
+    const previousEvents = coalesceRecentEvents(m.recentEvents || [])
+        .filter(eventRenderable)
+        .slice(0, maxPreviousEvents)
+        .map(compactRecentEventForPayload);
+
+    const recentTurns = getRecentTurns(recentLimit).map(turn => ({
+        ...turn,
+        text: truncateExtractorText(turn.text, maxTurnChars)
+    }));
+
+    return {
+        task: compact
+            ? 'Propose sparse Phase 1 continuity delta. Compact retry after context overflow.'
+            : 'Propose Phase 1 continuity state delta from recent SillyTavern chat turns.',
         previous_CurrentScene: m.currentScene,
-        previous_RecentEvents: m.recentEvents,
-        recent_chat_turns: getRecentTurns(s.recentMessageLimit)
-    }, null, 2);
+        previous_RecentEvents: previousEvents,
+        recent_chat_turns: recentTurns
+    };
+}
+
+function buildExtractorUserPayload(options = {}) {
+    const s = settings();
+    const compact = Boolean(options.compact);
+    const maxPayloadChars = Math.max(4000, Number(s.maxExtractorPayloadChars || 14000));
+    const payloadObject = buildExtractorPayloadObject(options);
+    let payload = JSON.stringify(payloadObject, null, 2);
+
+    while (payload.length > maxPayloadChars && payloadObject.recent_chat_turns.length > 2) {
+        payloadObject.recent_chat_turns.shift();
+        payload = JSON.stringify(payloadObject, null, 2);
+    }
+
+    if (payload.length > maxPayloadChars && !compact) {
+        return buildExtractorUserPayload({ compact: true });
+    }
+
+    metadata().lastExtractorPayloadChars = payload.length;
+    return payload;
+}
+
+function isContextExceededError(error) {
+    return /context size|context length|maximum context|too many tokens|prompt is too long|exceeded/i.test(String(error?.message || error || ''));
 }
 
 
@@ -150,7 +214,7 @@ async function callExtractor(promptPayload) {
 function pruneStoredRecentEvents() {
     const m = metadata();
     const before = (m.recentEvents || []).length;
-    m.recentEvents = (m.recentEvents || []).filter(eventRenderable);
+    m.recentEvents = coalesceRecentEvents(m.recentEvents || []).filter(eventRenderable);
     const maxEvents = Math.max(1, Number(settings().unresolvedEventLimit || 6));
     m.recentEvents = m.recentEvents.slice(0, maxEvents);
     saveMetadataNow();
@@ -207,8 +271,18 @@ async function runExtraction(reason = 'manual') {
     inFlight = true;
     updateUiStatus('running', `Running extractor (${reason})...`);
     try {
-        const promptPayload = buildExtractorUserPayload();
-        const raw = await callExtractor(promptPayload);
+        let promptPayload = buildExtractorUserPayload();
+        let raw;
+        let compactRetryUsed = false;
+        try {
+            raw = await callExtractor(promptPayload);
+        } catch (error) {
+            if (!isContextExceededError(error)) throw error;
+            compactRetryUsed = true;
+            updateUiStatus('running', 'Context exceeded; retrying extractor with compact payload...');
+            promptPayload = buildExtractorUserPayload({ compact: true });
+            raw = await callExtractor(promptPayload);
+        }
         const delta = normalizeProposal(raw);
         const proposal = {
             id: `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -217,6 +291,8 @@ async function runExtraction(reason = 'manual') {
             chat_signature: sig,
             turn_count: (ctx().chat || []).length,
             status: hasSubstantiveDelta(delta) ? 'pending' : 'no_update',
+            context_retry_used: compactRetryUsed,
+            extractor_payload_chars: metadata().lastExtractorPayloadChars || promptPayload.length,
             delta,
             raw
         };
@@ -382,6 +458,7 @@ function applyProposalObject(proposal) {
     }
 
     const maxEvents = Math.max(1, Number(settings().unresolvedEventLimit || 6));
+    m.recentEvents = coalesceRecentEvents(m.recentEvents || []);
     if (!settings().keepResolvedEvents) {
         m.recentEvents = m.recentEvents.filter(eventRenderable).slice(0, maxEvents);
     } else if (settings().strictRecentEvents) {
@@ -480,7 +557,7 @@ function renderPackets() {
     sceneLines.push(...groupedObjectLines(scene.nearby_objects));
     if (scene.surroundings_summary) sceneLines.push(`Surroundings: ${scene.surroundings_summary}`);
 
-    const eventLines = (m.recentEvents || [])
+    const eventLines = coalesceRecentEvents(m.recentEvents || [])
         .filter(eventRenderable)
         .slice(0, Number(settings().unresolvedEventLimit || 6))
         .map(e => e.causal_result ? `${e.summary}; result: ${e.causal_result}` : e.summary);
@@ -512,6 +589,7 @@ function renderProposalSummary(proposal) {
     lines.push(`Review order: ${proposal.status === 'pending' ? 'next pending proposal (oldest first)' : 'not pending / audit view'}`);
     lines.push(`Reason: ${proposal.reason || 'unknown'}`);
     lines.push(`Turn count: ${proposal.turn_count ?? 'unknown'}`);
+    if (proposal.extractor_payload_chars) lines.push(`Extractor payload: ${proposal.extractor_payload_chars} chars${proposal.context_retry_used ? ' (compact retry used)' : ''}`);
     if (proposal.stale_scene_update_skipped) lines.push(`Stale scene update skipped: ${proposal.stale_scene_update_skipped}`);
     lines.push('');
 
@@ -753,6 +831,9 @@ function updatePanel() {
     setInputValue('sfe_apikey', s.apiKey);
     setInputValue('sfe_recent_limit', s.recentMessageLimit);
     setInputValue('sfe_max_tokens', s.maxTokens);
+    setInputValue('sfe_max_input_chars', s.maxInputCharsPerTurn);
+    setInputValue('sfe_max_previous_events_payload', s.maxPreviousRecentEventsForPayload);
+    setInputValue('sfe_max_payload_chars', s.maxExtractorPayloadChars);
     setInputValue('sfe_trigger', s.trigger);
     setInputValue('sfe_autorun_policy', s.autoRunPolicy);
     setInputValue('sfe_periodic_user_messages', s.periodicUserMessages);
@@ -764,6 +845,7 @@ function updatePanel() {
     setInputValue('sfe_strict_events', s.strictRecentEvents, 'checked');
     setInputValue('sfe_min_event_importance', s.minEventImportance);
     setInputValue('sfe_max_events_per_proposal', s.maxEventsPerProposal);
+    setInputValue('sfe_recent_event_coalescing_mode', s.recentEventsCoalescingMode || 'conservative');
     setInputValue('sfe_clear_objects_on_location_change', s.clearRoomObjectsOnLocationChange, 'checked');
     setInputValue('sfe_surroundings_mode', s.surroundingsUpdateMode || 'location_only');
     setInputValue('sfe_object_coalescing_mode', s.objectCoalescingMode || 'conservative');
@@ -791,7 +873,7 @@ ${m.lastRawExtractorText}` : 'No extractor output yet.');
         const pending = m.pendingProposals.filter(p => p.status === 'pending').length;
         const next = pendingProposalsOrdered()[0];
         const nextText = next ? ` | next pending turn: ${next.turn_count ?? '?'}` : '';
-        countEl.textContent = `v${EXTENSION_VERSION} | pending ${pending}${nextText} | runs ${m.auditLog.length} | skipped ${m.skippedRuns || 0} | last run ${m.lastRunAt || 'never'} | last skip ${m.lastSkipReason || 'none'}`;
+        countEl.textContent = `v${EXTENSION_VERSION} | pending ${pending}${nextText} | runs ${m.auditLog.length} | skipped ${m.skippedRuns || 0} | payload ${m.lastExtractorPayloadChars || 0} chars | last run ${m.lastRunAt || 'never'} | last skip ${m.lastSkipReason || 'none'}`;
     }
 
     if (m.lastError) updateUiStatus('bad', `Last error: ${m.lastError}`);
@@ -899,12 +981,14 @@ function installUi() {
         <div class="sfe-row"><label for="sfe_model">Model</label><input id="sfe_model" type="text" spellcheck="false"></div>
         <div class="sfe-row"><label for="sfe_apikey">API key</label><input id="sfe_apikey" type="text" spellcheck="false" placeholder="blank for LM Studio"></div>
         <div class="sfe-row"><label for="sfe_recent_limit">Recent messages</label><input id="sfe_recent_limit" type="number" min="2" max="40" step="1"><label for="sfe_max_tokens">Max output tokens</label><input id="sfe_max_tokens" type="number" min="100" max="4000" step="50"></div>
-        <div class="sfe-row"><label><input id="sfe_json_response" type="checkbox"> Request JSON response_format</label></div>
+        <div class="sfe-row"><label for="sfe_max_input_chars">Max chars/message</label><input id="sfe_max_input_chars" type="number" min="200" max="4000" step="100"><label for="sfe_max_payload_chars">Max payload chars</label><input id="sfe_max_payload_chars" type="number" min="4000" max="60000" step="1000"></div>
+        <div class="sfe-row"><label for="sfe_max_previous_events_payload">Prev events in prompt</label><input id="sfe_max_previous_events_payload" type="number" min="0" max="12" step="1"><label><input id="sfe_json_response" type="checkbox"> Request JSON response_format</label></div>
       </fieldset>
 
       <fieldset><legend>Event gating</legend>
         <div class="sfe-row"><label><input id="sfe_strict_events" type="checkbox"> Strict RecentEvents gate</label></div>
         <div class="sfe-row"><label for="sfe_min_event_importance">Min event importance</label><input id="sfe_min_event_importance" type="number" min="0" max="5" step="1"><label for="sfe_max_events_per_proposal">Max events/proposal</label><input id="sfe_max_events_per_proposal" type="number" min="0" max="3" step="1"></div>
+        <div class="sfe-row"><label for="sfe_recent_event_coalescing_mode">RecentEvents coalescing</label><select id="sfe_recent_event_coalescing_mode"><option value="conservative">Conservative</option><option value="off">Off</option></select></div>
         <div class="sfe-row"><label><input id="sfe_event_cue_prefilter" type="checkbox"> High-salience event cue prefilter</label></div>
       </fieldset>
 
@@ -932,6 +1016,9 @@ function installUi() {
     bindSetting('sfe_apikey', 'apiKey');
     bindSetting('sfe_recent_limit', 'recentMessageLimit', 'number');
     bindSetting('sfe_max_tokens', 'maxTokens', 'number');
+    bindSetting('sfe_max_input_chars', 'maxInputCharsPerTurn', 'number');
+    bindSetting('sfe_max_previous_events_payload', 'maxPreviousRecentEventsForPayload', 'number');
+    bindSetting('sfe_max_payload_chars', 'maxExtractorPayloadChars', 'number');
     bindSetting('sfe_trigger', 'trigger');
     bindSetting('sfe_autorun_policy', 'autoRunPolicy');
     bindSetting('sfe_periodic_user_messages', 'periodicUserMessages', 'number');
@@ -943,6 +1030,7 @@ function installUi() {
     bindSetting('sfe_strict_events', 'strictRecentEvents', 'boolean');
     bindSetting('sfe_min_event_importance', 'minEventImportance', 'number');
     bindSetting('sfe_max_events_per_proposal', 'maxEventsPerProposal', 'number');
+    bindSetting('sfe_recent_event_coalescing_mode', 'recentEventsCoalescingMode');
     bindSetting('sfe_clear_objects_on_location_change', 'clearRoomObjectsOnLocationChange', 'boolean');
     bindSetting('sfe_surroundings_mode', 'surroundingsUpdateMode');
     bindSetting('sfe_object_coalescing_mode', 'objectCoalescingMode');
